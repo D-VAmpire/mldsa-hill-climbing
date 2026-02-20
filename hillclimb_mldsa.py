@@ -58,7 +58,14 @@ Optimization strategies (all independently toggleable):
     p positions to break compensating error clusters, then restarts local search.
     Best-ever solution is tracked across all perturbation rounds.
 
-  --all-optimizations: Enables all of the above.
+  --all-optimizations: Enables all of the above
+
+  Sequential position selection (--sequential-w):
+    Instead of random position sampling, maintains a pool of available
+    positions. Each iteration, w random positions are picked from available
+    and removed. Iteration 1 might pick [5,2], iteration 2 might pick [104,12].
+    When all positions exhausted, w increments and pool resets.
+
 
 Graceful interruption:
   Ctrl+C during execution will finish the current iteration, then print
@@ -438,10 +445,19 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
               # Tier 4: Iterated Local Search
               use_perturb_restart=False, perturb_strength=30,
               perturb_patience=50, perturb_max=50,
-              perturb_score_guided=False):
+              perturb_score_guided=False,
+              # Sequential position selection
+              use_sequential_w=False):
     """
     Hill-climbing key recovery using configurable fitness function,
     with optional optimization strategies including ILS.
+
+    Sequential position selection mode (--sequential-w):
+      When enabled, the algorithm maintains a pool of available positions for
+      each w size. Each iteration, w random positions are selected from the
+      available pool and removed. For example, iteration 1 could pick [5, 2],
+      iteration 2 could pick [104, 12], etc. When all n positions are exhausted,
+      w is incremented and the pool is reset to all positions.
 
     Returns:
         x_final:           (n,) recovered key estimate
@@ -488,18 +504,20 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
     tabu_queue = deque()
     sweep_permutation = None
     sweep_offset = 0
+    seq_w_available = {}  # For sequential-w: remaining positions per w size
     iters_since_improvement = 0
 
     def _reset_soft_state():
         """Reset exploration state after a perturbation."""
         nonlocal freq_counts, tabu_set, tabu_queue
         nonlocal sweep_permutation, sweep_offset, w_curr
-        nonlocal iters_since_improvement
+        nonlocal seq_w_available, iters_since_improvement
         freq_counts[:] = 0
         tabu_set.clear()
         tabu_queue.clear()
         sweep_permutation = None
         sweep_offset = 0
+        seq_w_available.clear()
         w_curr = w_base
         iters_since_improvement = 0
 
@@ -594,7 +612,39 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
             # ===== Position selection =====
             in_sweep = False
 
-            if sweep_interval > 0 and (t % sweep_interval) == 0:
+            if use_sequential_w:
+                # Initialize available positions for current w if not already done
+                if w_curr not in seq_w_available:
+                    seq_w_available[w_curr] = set(range(n))
+                
+                # Check if all positions have been tried for current w
+                if not seq_w_available[w_curr]:
+                    # All positions tried for current w, increase w
+                    new_w = min(w_curr + 1, n)
+                    if new_w != w_curr:
+                        w_curr = new_w
+                        iters_since_improvement = 0
+                        if verbose:
+                            print(f"    [sequential-w] w expanded to {w_curr}  "
+                                  f"({(2*eta+1)**w_curr} candidates/step)")
+                        # Reinitialize for new w (will be done at start of next iteration)
+                        continue
+                    else:
+                        # w is already at n, reset and start over
+                        seq_w_available[w_curr] = set(range(n))
+                
+                # Pick w random positions from available (not contiguous blocks)
+                available_list = list(seq_w_available[w_curr])
+                num_to_pick = min(w_curr, len(available_list))
+                selected_indices = rng.choice(len(available_list), size=num_to_pick, 
+                                             replace=False)
+                positions = np.array([available_list[i] for i in selected_indices], 
+                                    dtype=int)
+                
+                # Remove selected positions from available
+                for pos in positions:
+                    seq_w_available[w_curr].remove(pos)
+            elif sweep_interval > 0 and (t % sweep_interval) == 0:
                 # Tier 3b: forced deterministic sweep round
                 if sweep_permutation is None or sweep_offset >= n:
                     sweep_permutation = rng.permutation(n)
@@ -691,6 +741,11 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                     w_curr = w_base
                     if verbose:
                         print(f"    [VNS] w reset to {w_curr}")
+                # Reset sequential-w available positions when w resets
+                if use_sequential_w and w_curr == w_base:
+                    seq_w_available[w_base] = set(range(n))
+                    if verbose and use_adaptive_w:  # Only print if also using adaptive-w, to avoid duplicate messages
+                        print(f"    [sequential-w] w reset to {w_curr}")
             else:
                 iters_since_improvement += 1
 
@@ -1040,6 +1095,7 @@ def run_experiment(args):
         lateral=args.lateral_moves or args.all_optimizations,
         diversify=args.diversify or args.all_optimizations,
         perturb=args.perturb_restart or args.all_optimizations,
+        sequential_w=args.sequential_w,
     )
 
     beta_eff = compute_beta_eff(params, args.leakage)
@@ -1130,7 +1186,8 @@ def run_experiment(args):
                 perturb_strength=args.perturb_strength,
                 perturb_patience=args.perturb_patience,
                 perturb_max=args.perturb_max,
-                perturb_score_guided=args.perturb_score_guided)
+                perturb_score_guided=args.perturb_score_guided,
+                use_sequential_w=opt_flags["sequential_w"])
             t_hillclimb = perf_counter() - t0
 
             # --- Result evaluation (+ optional MOSEK fallback) ---
@@ -1338,6 +1395,10 @@ Examples:
     opt.add_argument("--perturb-score-guided", action="store_true",
                      help="Bias perturbation targets toward uncertain "
                           "positions")
+    opt.add_argument("--sequential-w", action="store_true",
+                     help="Sequential random position selection: pick w random "
+                          "positions from available pool each iteration. "
+                          "Increases w when all positions exhausted.")
 
     # MOSEK ILP fallback
     mosek_grp = parser.add_argument_group("MOSEK ILP fallback")
