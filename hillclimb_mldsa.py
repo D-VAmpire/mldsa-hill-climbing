@@ -63,7 +63,7 @@ Optimization strategies (all independently toggleable):
     positions that is used for w_base only to find all easily findable improvements.
     This way low hanging fruit is systematically harvested at low w before moving on to higher w.
 
-    --all-optimizations: Enables all of the above.
+--all-optimizations: Enables all of the above.
 
 Graceful interruption:
   Ctrl+C during execution will finish the current iteration, then print
@@ -1006,8 +1006,6 @@ def _print_summary(results, total_keys, seed=None, interrupted=False):
 
     print(f"\n=== Summary: {n_success}/{n_done} keys recovered "
           f"(of {total_keys} planned){status} ===")
-    if seed is not None:
-        print(f"  Seed: {seed}")
 
     if n_mosek_attempted > 0:
         n_climb_only = n_success - n_mosek_success
@@ -1114,10 +1112,6 @@ def run_experiment(args):
     original_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, _sigint_handler)
     _interrupt_event.clear()
-
-    # If no seed provided, generate one from system entropy so experiment is reproducible
-    if args.seed is None:
-        args.seed = np.random.SeedSequence().entropy
 
     rng = np.random.default_rng(args.seed)
     params = MLDSA_PARAMS[args.params]
@@ -1380,7 +1374,7 @@ Examples:
                       help="Number of informative relations to collect (r)")
     core.add_argument("--block-size", type=int, default=5,
                       help="Base block size w (positions per step)")
-    core.add_argument("--max-iter", type=int, default=100000,
+    core.add_argument("--max-iter", type=int, default=1000000,
                       help="Maximum hill-climbing iterations T")
     core.add_argument("--output", type=str, default=None,
                       help="CSV output path")
