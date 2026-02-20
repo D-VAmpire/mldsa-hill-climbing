@@ -437,7 +437,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
               # Tier 1: Score-guided sampling
               score_weights=None,
               # Tier 2: Adaptive block size / VNS
-              use_adaptive_w=False, adaptive_w_max=7, adaptive_w_patience=50,
+              use_adaptive_w=False, adaptive_w_max=6, adaptive_w_patience=50,
               # Tier 3a: Lateral moves
               use_lateral_moves=False, lateral_tabu_size=20,
               # Tier 3b: Frequency diversification
@@ -505,21 +505,28 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
     sweep_permutation = None
     sweep_offset = 0
     seq_w_available = {}  # For sequential-w: remaining positions per w size
+    seq_w_tried = {}     # Track positions that have been tried for each w
     iters_since_improvement = 0
 
     def _reset_soft_state():
         """Reset exploration state after a perturbation."""
         nonlocal freq_counts, tabu_set, tabu_queue
         nonlocal sweep_permutation, sweep_offset, w_curr
-        nonlocal seq_w_available, iters_since_improvement
+        nonlocal seq_w_available, seq_w_tried
+        nonlocal iters_since_improvement
         freq_counts[:] = 0
         tabu_set.clear()
         tabu_queue.clear()
         sweep_permutation = None
         sweep_offset = 0
         seq_w_available.clear()
+        seq_w_tried.clear()
         w_curr = w_base
         iters_since_improvement = 0
+        # Reinitialize sequential-w pool for base w
+        if use_sequential_w:
+            seq_w_available[w_base] = set(range(n))
+            seq_w_tried[w_base] = 0
 
     # ---------------------------------------------------------------
     # Precompute constraint bounds (constant throughout)
@@ -559,6 +566,12 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                 if use_parallel else None)
 
     iters_used = 0
+    
+    # Initialize sequential-w pool for base w
+    if use_sequential_w:
+        seq_w_available[w_base] = set(range(n))
+        seq_w_tried[w_base] = 0
+    
     try:
         for t in range(1, T + 1):
             if F_curr == 0 or _interrupt_event.is_set():
@@ -613,16 +626,18 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
             in_sweep = False
 
             if use_sequential_w:
-                # Initialize available positions for current w if not already done
-                if w_curr not in seq_w_available:
-                    seq_w_available[w_curr] = set(range(n))
-                
-                # Check if all positions have been tried for current w
-                if not seq_w_available[w_curr]:
-                    # All positions tried for current w, increase w
-                    new_w = min(w_curr + 1, n)
+               
+                # Check if all positions have been tried for current w (and w wasn't just adapted)
+                if (not seq_w_available[w_curr]):
+                    
+                    # Try to expand w to the next level
+                    new_w = min(w_curr + 1, adaptive_w_max, n)
+                    
                     if new_w != w_curr:
+                        # Successfully expanded
                         w_curr = new_w
+                        seq_w_available[w_curr] = set(range(n))
+                        seq_w_tried[w_curr] = 0
                         iters_since_improvement = 0
                         if verbose:
                             print(f"    [sequential-w] w expanded to {w_curr}  "
@@ -630,20 +645,28 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                         # Reinitialize for new w (will be done at start of next iteration)
                         continue
                     else:
-                        # w is already at n, reset and start over
-                        seq_w_available[w_curr] = set(range(n))
+                        # w is already at max (can't expand), trigger perturbation if enabled
+                        if use_perturb_restart and num_perturbations < perturb_max:
+                            # Force ILS perturbation on next iteration
+                            iters_since_improvement = perturb_patience
+                        else:
+                            # Otherwise reset and continue exploring at current w
+                            seq_w_available[w_curr] = set(range(n))
+                            seq_w_tried[w_curr] = 0
                 
                 # Pick w random positions from available (not contiguous blocks)
                 available_list = list(seq_w_available[w_curr])
+                
                 num_to_pick = min(w_curr, len(available_list))
                 selected_indices = rng.choice(len(available_list), size=num_to_pick, 
                                              replace=False)
                 positions = np.array([available_list[i] for i in selected_indices], 
                                     dtype=int)
                 
-                # Remove selected positions from available
+                # Remove selected positions from available and track tried count
                 for pos in positions:
                     seq_w_available[w_curr].remove(pos)
+                seq_w_tried[w_curr] += len(positions)
             elif sweep_interval > 0 and (t % sweep_interval) == 0:
                 # Tier 3b: forced deterministic sweep round
                 if sweep_permutation is None or sweep_offset >= n:
@@ -742,8 +765,10 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                     if verbose:
                         print(f"    [VNS] w reset to {w_curr}")
                 # Reset sequential-w available positions when w resets
-                if use_sequential_w and w_curr == w_base:
+                if use_sequential_w:
+                    w_curr = w_base
                     seq_w_available[w_base] = set(range(n))
+                    seq_w_tried[w_base] = 0
                     if verbose and use_adaptive_w:  # Only print if also using adaptive-w, to avoid duplicate messages
                         print(f"    [sequential-w] w reset to {w_curr}")
             else:
@@ -755,9 +780,15 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                 if new_w != w_curr:
                     w_curr = new_w
                     iters_since_improvement = 0
+                    # Initialize sequential-w pool for new w if using sequential-w
+                    if use_sequential_w:
+                        seq_w_available[w_curr] = set(range(n))
+                        seq_w_tried[w_curr] = 0
                     if verbose:
                         print(f"    [VNS] w expanded to {w_curr}  "
                               f"({(2*eta+1)**w_curr} candidates/step)")
+                    # Skip position selection for this iteration; start fresh with new w next iteration
+                    continue
 
             # ===== Logging =====
             D_now = (int(np.sum(x_curr != true_key))
@@ -958,7 +989,7 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
 # ===================================================================
 # Output helpers
 # ===================================================================
-def _print_summary(results, total_keys, interrupted=False):
+def _print_summary(results, total_keys, seed=None, interrupted=False):
     """Print experiment summary from collected results."""
     n_done = len(results)
     n_success = sum(1 for r in results if r["success"])
@@ -970,6 +1001,8 @@ def _print_summary(results, total_keys, interrupted=False):
 
     print(f"\n=== Summary: {n_success}/{n_done} keys recovered "
           f"(of {total_keys} planned){status} ===")
+    if seed is not None:
+        print(f"  Seed: {seed}")
 
     if n_mosek_attempted > 0:
         n_climb_only = n_success - n_mosek_success
@@ -1076,6 +1109,10 @@ def run_experiment(args):
     original_handler = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGINT, _sigint_handler)
     _interrupt_event.clear()
+
+    # If no seed provided, generate one from system entropy so experiment is reproducible
+    if args.seed is None:
+        args.seed = np.random.SeedSequence().entropy
 
     rng = np.random.default_rng(args.seed)
     params = MLDSA_PARAMS[args.params]
@@ -1282,7 +1319,7 @@ def run_experiment(args):
     finally:
         interrupted = _interrupt_event.is_set()
         if results:
-            _print_summary(results, args.num_keys, interrupted=interrupted)
+            _print_summary(results, args.num_keys, seed=args.seed, interrupted=interrupted)
             if csv_path:
                 _write_csv(results, csv_path)
         elif interrupted:
