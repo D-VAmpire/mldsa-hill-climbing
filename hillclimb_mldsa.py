@@ -58,14 +58,12 @@ Optimization strategies (all independently toggleable):
     p positions to break compensating error clusters, then restarts local search.
     Best-ever solution is tracked across all perturbation rounds.
 
-  --all-optimizations: Enables all of the above
-
-  Sequential position selection (--sequential-w):
+  Tier 5 -- Sequential position selection (--sequential-w):
     Instead of random position sampling, maintains a pool of available
-    positions. Each iteration, w random positions are picked from available
-    and removed. Iteration 1 might pick [5,2], iteration 2 might pick [104,12].
-    When all positions exhausted, w increments and pool resets.
+    positions that is used for w_base only to find all easily findable improvements.
+    This way low hanging fruit is systematically harvested at low w before moving on to higher w.
 
+    --all-optimizations: Enables all of the above.
 
 Graceful interruption:
   Ctrl+C during execution will finish the current iteration, then print
@@ -599,6 +597,12 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                         F_best_ever = F_curr
                         x_best_ever = x_curr.copy()
                         ip_best_ever = ip.copy()
+                    else:
+                        # Restore best-ever before perturbing, to avoid drifting too far
+                        x_curr = x_best_ever.copy()
+                        ip = ip_best_ever.copy()
+                        fitness_curr = fitness_best_ever
+                        F_curr = F_best_ever
 
                     # Apply perturbation
                     x_curr[perturb_pos] = rng.integers(
@@ -625,7 +629,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
             # ===== Position selection =====
             in_sweep = False
 
-            if use_sequential_w:
+            if use_sequential_w and (w_curr == w_base or not use_adaptive_w):
                
                 # Check if all positions have been tried for current w (and w wasn't just adapted)
                 if (not seq_w_available[w_curr]):
@@ -775,7 +779,8 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                 iters_since_improvement += 1
 
             if (use_adaptive_w
-                    and iters_since_improvement >= adaptive_w_patience):
+                    and iters_since_improvement >= adaptive_w_patience
+                    and (w_curr > w_base or not use_sequential_w)):
                 new_w = min(w_curr + 1, adaptive_w_max, n)
                 if new_w != w_curr:
                     w_curr = new_w
@@ -1132,7 +1137,7 @@ def run_experiment(args):
         lateral=args.lateral_moves or args.all_optimizations,
         diversify=args.diversify or args.all_optimizations,
         perturb=args.perturb_restart or args.all_optimizations,
-        sequential_w=args.sequential_w,
+        sequential_w=args.sequential_w or args.all_optimizations,
     )
 
     beta_eff = compute_beta_eff(params, args.leakage)
@@ -1349,6 +1354,7 @@ Optimization strategies:
   --lateral-moves     Tier 3a: Accept ties to drift along plateaus
   --diversify         Tier 3b: Penalise frequently selected positions
   --perturb-restart   Tier 4: ILS -- perturb & restart to escape plateaus
+  --sequential-w      Tier 5: Sequentially sample all w_base-size subsets before repeating for higher w
   --all-optimizations Enable all of the above
 
 MOSEK ILP fallback:
@@ -1374,7 +1380,7 @@ Examples:
                       help="Number of informative relations to collect (r)")
     core.add_argument("--block-size", type=int, default=5,
                       help="Base block size w (positions per step)")
-    core.add_argument("--max-iter", type=int, default=1000000,
+    core.add_argument("--max-iter", type=int, default=100000,
                       help="Maximum hill-climbing iterations T")
     core.add_argument("--output", type=str, default=None,
                       help="CSV output path")
