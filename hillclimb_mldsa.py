@@ -249,11 +249,12 @@ def generate_informative_relations(rng, x_true, r_target, params,
 
             cx = int(np.dot(x_true[c_idx], c_signs))
             z = y + cx
-            total_signatures += 1
 
-            # Rejection sampling
+            # Mimic rejection sampling
             if not (-(gamma - beta) < z < (gamma - beta)):
                 continue
+
+            total_signatures += 1
 
             z_bar = extract_lwe_relation(z, ell, y_j)
 
