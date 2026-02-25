@@ -22,6 +22,23 @@ New in v6 -- Optional MOSEK ILP fallback (--mosek):
 
   Requires the MOSEK Python package (``pip install Mosek``) and a valid license.
 
+Optional Gurobi ILP fallback (--gurobi):
+  Alternative ILP fallback using Gurobi as a pure feasibility solver (no
+  objective function).  The hill-climbing estimate x' is injected via Gurobi's
+  VarHintVal mechanism, which guides both heuristics and branching decisions
+  throughout the MIP search.  Formulation:
+
+    find       x
+    subject to lb_i <= <c_i, x> <= ub_i    for every informative relation i
+               x_j in {-eta, ..., eta}      for j = 1, ..., n
+
+  The --gurobi-solution-limit K option activates Gurobi's solution pool
+  (PoolSearchMode=2) to enumerate up to K distinct feasible solutions.  This
+  is useful in the low-relation regime where multiple keys may satisfy the
+  constraints.
+
+  Requires the gurobipy package (``pip install gurobipy``) and a valid license.
+
 Fitness modes (--fitness):
 
   excess (default):
@@ -64,7 +81,8 @@ Graceful interruption:
   Ctrl+C during execution will finish the current iteration, then print
   summary statistics for all keys processed so far and write partial CSV
   output if --output was specified.  Ctrl+C also interrupts an active MOSEK
-  solve gracefully via Model.breakSolver().
+  solve gracefully via Model.breakSolver() or an active Gurobi solve via
+  Model.terminate().
 
 Usage:
   python hillclimb_mldsa_v6.py --params 44 --inf-rels 25000 --block-size 5
@@ -94,10 +112,12 @@ from scipy.sparse.linalg import lsqr
 _interrupt_event = threading.Event()
 _active_mosek_model = None          # Set while MOSEK is solving
 _active_mosek_lock = threading.Lock()
+_active_gurobi_model = None         # Set while Gurobi is solving
+_active_gurobi_lock = threading.Lock()
 
 
 def _sigint_handler(signum, frame):
-    """Handle Ctrl+C: set interrupt flag and break MOSEK if active."""
+    """Handle Ctrl+C: set interrupt flag and break active solver."""
     if _interrupt_event.is_set():
         sys.exit(1)  # Second Ctrl+C: hard exit
 
@@ -109,6 +129,14 @@ def _sigint_handler(signum, frame):
             print("\n  [INTERRUPT] Ctrl+C -- breaking MOSEK solver...",
                   flush=True)
             _active_mosek_model.breakSolver()
+            return
+
+    # If Gurobi is currently solving, terminate it immediately
+    with _active_gurobi_lock:
+        if _active_gurobi_model is not None:
+            print("\n  [INTERRUPT] Ctrl+C -- terminating Gurobi solver...",
+                  flush=True)
+            _active_gurobi_model.terminate()
             return
 
     print("\n  [INTERRUPT] Ctrl+C -- finishing current iteration, "
@@ -901,6 +929,191 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
 
 
 # ===================================================================
+# Gurobi ILP fallback: exact key recovery via integer feasibility
+# ===================================================================
+def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
+                        gurobi_timeout=300.0, norel_time=0.0,
+                        solution_limit=1, verbose=True):
+    """
+    Attempt key recovery by solving a pure Integer Feasibility Problem
+    with Gurobi, using variable hints from the hill-climbing estimate.
+
+    Unlike the MOSEK formulation which uses an L1 objective to guide search,
+    this formulation has *no objective function*.  Instead, the hill-climbing
+    estimate x' is provided via Gurobi's VarHintVal mechanism, which guides
+    both heuristics and branching decisions throughout the MIP search.
+
+    ILP formulation:
+        find       x
+        subject to lb_i <= sum_j C[i,j] * x_j <= ub_i   for all relations i
+                   x_j in {-eta, ..., eta}               for all j
+
+    where lb_i = z_tilde_i - beta_eff,  ub_i = z_tilde_i + beta_eff.
+
+    When solution_limit > 1, Gurobi's solution pool (PoolSearchMode=2) is
+    activated to enumerate multiple distinct feasible solutions.  This is
+    useful in the low-relation regime where the constraint system may admit
+    more than one key.  Post-solve verification checks each pool solution
+    against x_true.
+
+    Parameters:
+        C:              (R, n) int8 challenge matrix
+        z_tilde:        (R,) transformed relation values
+        x_warm:         (n,) best key estimate from hill climbing (int8)
+        params:         ML-DSA parameter dict
+        leakage_index:  bit position j of the leaked bit
+        gurobi_timeout: solver time limit in seconds (default: 300)
+        norel_time:     time budget for no-relaxation heuristic before B&B
+                        (default: 0.0 = Gurobi default behaviour)
+        solution_limit: number of feasible solutions to find (default: 1)
+        verbose:        print solver progress
+
+    Returns:
+        solutions: list of (n,) int8 arrays, one per pool solution found,
+                   or empty list if no feasible solution was found
+        t_gurobi:  float, wall-clock time spent in Gurobi
+    """
+    global _active_gurobi_model
+
+    try:
+        import gurobipy as gp
+        from gurobipy import GRB
+    except ImportError:
+        print("  [GUROBI] ERROR: gurobipy not available. "
+              "Install with: pip install gurobipy")
+        return [], 0.0
+
+    n = params["n"]
+    eta = params["eta"]
+    beta_eff = compute_beta_eff(params, leakage_index)
+    R = C.shape[0]
+
+    lb = z_tilde - beta_eff
+    ub = z_tilde + beta_eff
+
+    if verbose:
+        print(f"  [GUROBI] Building feasibility ILP: {n} integer vars, "
+              f"{R} relations, eta={eta}, beta_eff={beta_eff}")
+        if solution_limit > 1:
+            print(f"  [GUROBI] Solution pool: up to {solution_limit} "
+                  f"solutions requested")
+
+    t0 = perf_counter()
+
+    try:
+        env = gp.Env(empty=True)
+        if not verbose:
+            env.setParam("OutputFlag", 0)
+        env.start()
+
+        with gp.Model("mldsa_key_recovery", env=env) as M:
+            # Register model for signal-handler access
+            with _active_gurobi_lock:
+                _active_gurobi_model = M
+
+            try:
+                # Decision variables: x_j in {-eta, ..., eta}
+                x = M.addMVar(n, vtype=GRB.INTEGER,
+                              lb=float(-eta), ub=float(eta), name="x")
+
+                # Verification relation constraints: lb <= C @ x <= ub
+                C_f64 = C.astype(np.float64)
+                M.addMConstr(C_f64, x, GRB.GREATER_EQUAL, lb, name="verify_lb")
+                M.addMConstr(C_f64, x, GRB.LESS_EQUAL, ub, name="verify_ub")
+
+                # No objective -- pure feasibility problem
+                M.setObjective(0)
+
+                # Variable hints from hill-climbing estimate
+                x_warm_f = x_warm.astype(np.float64)
+                for j in range(n):
+                    x[j].VarHintVal = x_warm_f[j]
+
+                # Solver parameters: feasibility-focused
+                M.setParam("MIPFocus", 1)
+                M.setParam("SolutionLimit", solution_limit)
+                M.setParam("TimeLimit", gurobi_timeout)
+
+                if norel_time > 0:
+                    M.setParam("NoRelHeurTime", norel_time)
+
+                # Solution pool for multi-solution enumeration
+                if solution_limit > 1:
+                    M.setParam("PoolSolutions", solution_limit)
+                    M.setParam("PoolSearchMode", 2)
+
+                if verbose:
+                    print(f"  [GUROBI] Solving feasibility ILP "
+                          f"(timeout={gurobi_timeout}s, "
+                          f"norel={norel_time}s)...")
+
+                M.optimize()
+
+            finally:
+                # Unregister model so signal handler won't touch it
+                with _active_gurobi_lock:
+                    _active_gurobi_model = None
+
+            t_gurobi = perf_counter() - t0
+
+            # Report interrupt
+            if _interrupt_event.is_set():
+                print(f"  [GUROBI] Interrupted ({t_gurobi:.2f}s)")
+
+            # Extract solutions
+            solutions = []
+            status = M.Status
+
+            if status in (GRB.OPTIMAL, GRB.SOLUTION_LIMIT,
+                          GRB.TIME_LIMIT, GRB.INTERRUPTED):
+                n_found = M.SolCount
+                if n_found == 0:
+                    if verbose:
+                        print(f"  [GUROBI] No feasible solution found "
+                              f"({t_gurobi:.2f}s)")
+                    return [], t_gurobi
+
+                for s in range(n_found):
+                    M.Params.SolutionNumber = s
+                    x_level = x.Xn
+                    x_sol = np.round(x_level).astype(np.int8)
+                    x_sol = np.clip(x_sol, -eta, eta)
+
+                    # Post-solve constraint verification
+                    ip_check = C.astype(np.int32) @ x_sol.astype(np.int32)
+                    violated = int(np.sum((ip_check < lb) | (ip_check > ub)))
+
+                    if violated > 0 and verbose:
+                        print(f"  [GUROBI] Pool solution {s}: violates "
+                              f"{violated} constraints (numerical issue?)")
+
+                    solutions.append(x_sol)
+
+                if verbose:
+                    print(f"  [GUROBI] Found {n_found} feasible solution(s) "
+                          f"({t_gurobi:.2f}s)")
+
+                return solutions, t_gurobi
+
+            elif status == GRB.INFEASIBLE:
+                if verbose:
+                    print(f"  [GUROBI] Problem proven infeasible "
+                          f"({t_gurobi:.2f}s)")
+                return [], t_gurobi
+            else:
+                if verbose:
+                    print(f"  [GUROBI] Solver ended with status {status} "
+                          f"({t_gurobi:.2f}s)")
+                return [], t_gurobi
+
+    except Exception as e:
+        t_gurobi = perf_counter() - t0
+        if verbose:
+            print(f"  [GUROBI] Error: {e} ({t_gurobi:.2f}s)")
+        return [], t_gurobi
+
+
+# ===================================================================
 # Output helpers
 # ===================================================================
 def _print_summary(results, total_keys, interrupted=False):
@@ -911,15 +1124,25 @@ def _print_summary(results, total_keys, interrupted=False):
                            if r.get("mosek_attempted", False))
     n_mosek_success = sum(1 for r in results
                          if r.get("mosek_success", False))
+    n_gurobi_attempted = sum(1 for r in results
+                             if r.get("gurobi_attempted", False))
+    n_gurobi_success = sum(1 for r in results
+                           if r.get("gurobi_success", False))
     status = " (INTERRUPTED)" if interrupted else ""
 
     print(f"\n=== Summary: {n_success}/{n_done} keys recovered "
           f"(of {total_keys} planned){status} ===")
 
-    if n_mosek_attempted > 0:
-        n_climb_only = n_success - n_mosek_success
-        print(f"  Hill-climbing alone: {n_climb_only}, "
-              f"MOSEK ILP fallback: {n_mosek_success}/{n_mosek_attempted}")
+    if n_mosek_attempted > 0 or n_gurobi_attempted > 0:
+        n_solver_success = n_mosek_success + n_gurobi_success
+        n_climb_only = n_success - n_solver_success
+        print(f"  Hill-climbing alone: {n_climb_only}")
+        if n_mosek_attempted > 0:
+            print(f"  MOSEK ILP fallback: "
+                  f"{n_mosek_success}/{n_mosek_attempted}")
+        if n_gurobi_attempted > 0:
+            print(f"  Gurobi ILP fallback: "
+                  f"{n_gurobi_success}/{n_gurobi_attempted}")
 
     if n_success > 0:
         succ = [r for r in results if r["success"]]
@@ -935,6 +1158,17 @@ def _print_summary(results, total_keys, interrupted=False):
             mosek_succ = [r for r in results if r.get("mosek_success", False)]
             print(f"  Avg MOSEK solve time (successful): "
                   f"{np.mean([r['t_mosek'] for r in mosek_succ]):.2f}s")
+        if n_gurobi_success > 0:
+            grb_succ = [r for r in results
+                        if r.get("gurobi_success", False)]
+            print(f"  Avg Gurobi solve time (successful): "
+                  f"{np.mean([r['t_gurobi'] for r in grb_succ]):.2f}s")
+            # Report multi-solution stats if any
+            pool_counts = [r.get("gurobi_solutions_found", 0)
+                           for r in grb_succ]
+            if any(c > 1 for c in pool_counts):
+                print(f"  Avg Gurobi pool solutions (successful): "
+                      f"{np.mean(pool_counts):.1f}")
 
     fail_results = [r for r in results if not r["success"]]
     if fail_results:
@@ -976,6 +1210,14 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
 
     if args.mosek:
         print(f"  MOSEK ILP fallback: enabled (timeout={args.mosek_timeout}s)")
+
+    if args.gurobi:
+        norel_str = (f", norel={args.gurobi_norel_time}s"
+                     if args.gurobi_norel_time > 0 else "")
+        pool_str = (f", pool={args.gurobi_solution_limit}"
+                    if args.gurobi_solution_limit > 1 else "")
+        print(f"  Gurobi ILP fallback: enabled "
+              f"(timeout={args.gurobi_timeout}s{norel_str}{pool_str})")
 
     mode_desc = {"count": "count (violation count, L0)",
                  "excess": "excess (sum of constraint excesses, L1)",
@@ -1133,12 +1375,16 @@ def run_experiment(args):
                 perturb_score_guided=args.perturb_score_guided)
             t_hillclimb = perf_counter() - t0
 
-            # --- Result evaluation (+ optional MOSEK fallback) ---
+            # --- Result evaluation (+ optional MOSEK / Gurobi fallback) ---
             success = bool(np.array_equal(x_final, x_true))
             D_final = int(np.sum(x_final != x_true))
             t_mosek = 0.0
             mosek_attempted = False
             mosek_success = False
+            t_gurobi = 0.0
+            gurobi_attempted = False
+            gurobi_success = False
+            gurobi_solutions_found = 0
 
             if F_final == 0 and not success:
                 print(f"  *** FALSE POSITIVE: F=0 but D={D_final} ***")
@@ -1188,6 +1434,71 @@ def run_experiment(args):
                         print(f"  MOSEK ILP did not find a solution "
                               f"({t_mosek:.2f}s)")
 
+                # Gurobi ILP fallback (runs if still not successful)
+                if (args.gurobi and not success
+                        and not _interrupt_event.is_set()):
+                    gurobi_attempted = True
+                    sol_str = (f", pool={args.gurobi_solution_limit}"
+                               if args.gurobi_solution_limit > 1 else "")
+                    print(f"  Attempting Gurobi feasibility ILP from "
+                          f"hill-climbing warm start "
+                          f"(D={D_final}{sol_str})...")
+                    grb_solutions, t_gurobi = gurobi_ilp_recovery(
+                        C, z_tilde, x_final, params, args.leakage,
+                        gurobi_timeout=args.gurobi_timeout,
+                        norel_time=args.gurobi_norel_time,
+                        solution_limit=args.gurobi_solution_limit,
+                        verbose=verbose)
+
+                    gurobi_solutions_found = len(grb_solutions)
+
+                    if grb_solutions:
+                        # Check each pool solution against true key
+                        for s_idx, x_grb in enumerate(grb_solutions):
+                            D_grb = int(np.sum(x_grb != x_true))
+                            if np.array_equal(x_grb, x_true):
+                                gurobi_success = True
+                                x_final = x_grb
+                                D_final = 0
+                                F_final = 0
+                                success = True
+                                if gurobi_solutions_found > 1:
+                                    print(
+                                        f"  SUCCESS (Gurobi): key is pool "
+                                        f"solution {s_idx} of "
+                                        f"{gurobi_solutions_found} "
+                                        f"({t_hillclimb:.2f}s climb + "
+                                        f"{t_gurobi:.2f}s ILP)")
+                                else:
+                                    print(
+                                        f"  SUCCESS (Gurobi): key recovered "
+                                        f"({t_hillclimb:.2f}s climb + "
+                                        f"{t_gurobi:.2f}s ILP)")
+                                break
+                            elif verbose:
+                                print(
+                                    f"  Gurobi pool solution {s_idx}: "
+                                    f"D={D_grb}")
+
+                        if not gurobi_success:
+                            # Pick the closest solution as best estimate
+                            distances = [int(np.sum(x_g != x_true))
+                                         for x_g in grb_solutions]
+                            best_idx = int(np.argmin(distances))
+                            D_grb_best = distances[best_idx]
+                            print(
+                                f"  Gurobi found {gurobi_solutions_found} "
+                                f"solution(s), none is the true key "
+                                f"(best D={D_grb_best})")
+                            if D_grb_best < D_final:
+                                print(f"  Gurobi improved D: "
+                                      f"{D_final} -> {D_grb_best}")
+                                x_final = grb_solutions[best_idx]
+                                D_final = D_grb_best
+                    else:
+                        print(f"  Gurobi ILP did not find a solution "
+                              f"({t_gurobi:.2f}s)")
+
             if verbose and print_keys:
                 print(f"  True key: {format_key(x_true)}")
 
@@ -1217,6 +1528,10 @@ def run_experiment(args):
                 t_mosek=t_mosek,
                 mosek_attempted=mosek_attempted,
                 mosek_success=mosek_success,
+                t_gurobi=t_gurobi,
+                gurobi_attempted=gurobi_attempted,
+                gurobi_success=gurobi_success,
+                gurobi_solutions_found=gurobi_solutions_found,
                 **{f"opt_{k}": v for k, v in opt_flags.items()},
             )
             results.append(result)
@@ -1261,10 +1576,20 @@ MOSEK ILP fallback:
   --mosek             On failure, attempt exact recovery via MOSEK ILP
   --mosek-timeout N   Solver time limit in seconds (default: 300)
 
+Gurobi ILP fallback:
+  --gurobi                   On failure, attempt recovery via Gurobi ILP
+  --gurobi-timeout N         Solver time limit in seconds (default: 300)
+  --gurobi-norel-time N      No-relaxation heuristic budget (default: 0)
+  --gurobi-solution-limit K  Find up to K solutions (default: 1)
+
 Examples:
   python hillclimb_mldsa_v6.py --params 44 --inf-rels 25000 --block-size 5
   python hillclimb_mldsa_v6.py --params 44 --inf-rels 25000 --block-size 5 \\
       --all-optimizations --mosek --mosek-timeout 120
+  python hillclimb_mldsa_v6.py --params 44 --inf-rels 25000 --block-size 5 \\
+      --all-optimizations --gurobi --gurobi-timeout 120 --gurobi-norel-time 30
+  python hillclimb_mldsa_v6.py --params 44 --inf-rels 15000 --block-size 5 \\
+      --gurobi --gurobi-solution-limit 10
         """,
     )
 
@@ -1347,6 +1672,25 @@ Examples:
     mosek_grp.add_argument(
         "--mosek-timeout", type=float, default=300.0,
         help="MOSEK solver time limit in seconds (default: 300)")
+
+    # Gurobi ILP fallback
+    gurobi_grp = parser.add_argument_group("Gurobi ILP fallback")
+    gurobi_grp.add_argument(
+        "--gurobi", action="store_true",
+        help="On failure, attempt recovery via Gurobi feasibility ILP")
+    gurobi_grp.add_argument(
+        "--gurobi-timeout", type=float, default=300.0,
+        help="Gurobi solver time limit in seconds (default: 300)")
+    gurobi_grp.add_argument(
+        "--gurobi-norel-time", type=float, default=0.0,
+        help="No-relaxation heuristic time budget in seconds (default: 0 = "
+             "Gurobi default). Runs a feasibility heuristic before B&B; "
+             "terminates immediately on finding a feasible point.")
+    gurobi_grp.add_argument(
+        "--gurobi-solution-limit", type=int, default=1,
+        help="Number of feasible solutions to find (default: 1). "
+             "When >1, activates Gurobi's solution pool to enumerate "
+             "multiple distinct keys.")
 
     args = parser.parse_args()
     run_experiment(args)
