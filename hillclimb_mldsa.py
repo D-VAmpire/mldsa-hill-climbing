@@ -619,22 +619,6 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                     and iters_since_improvement >= perturb_patience):
                 adaptive_exhausted = ((not use_adaptive_w)
                                       or (w_curr >= adaptive_w_max))
-                # Save or restore best-ever (regardless of whether we
-                # actually perturb -- keeps best-ever tracking consistent)
-                if fitness_curr < fitness_best_ever:
-                    fitness_best_ever = fitness_curr
-                    F_best_ever = F_curr
-                    x_best_ever = x_curr.copy()
-                    ip_best_ever = ip.copy()
-                elif fitness_curr > fitness_best_ever:
-                    # Restore best-ever to avoid drifting too far
-                    x_curr = x_best_ever.copy()
-                    ip = ip_best_ever.copy()
-                    fitness_curr = fitness_best_ever
-                    F_curr = F_best_ever
-                # When sequential-w is active, also trigger when the pool at
-                # max w is exhausted (sequential-w sets iters_since_improvement
-                # = perturb_patience to force this path).
                 if adaptive_exhausted and num_perturbations < perturb_max:
                     num_perturbations += 1
                     p = min(perturb_strength, n)
@@ -644,6 +628,19 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                             n, size=p, replace=False, p=perturb_weights)
                     else:
                         perturb_pos = rng.choice(n, size=p, replace=False)
+
+                    # Save pre-perturbation best
+                    if fitness_curr < fitness_best_ever:
+                        fitness_best_ever = fitness_curr
+                        F_best_ever = F_curr
+                        x_best_ever = x_curr.copy()
+                        ip_best_ever = ip.copy()
+                    else:
+                        # Restore best-ever before perturbing, to avoid drifting too far
+                        x_curr = x_best_ever.copy()
+                        ip = ip_best_ever.copy()
+                        fitness_curr = fitness_best_ever
+                        F_curr = F_best_ever
 
                     # Apply perturbation
                     x_curr[perturb_pos] = rng.integers(
@@ -1717,7 +1714,7 @@ Examples:
                       help="Number of informative relations to collect (r)")
     core.add_argument("--block-size", type=int, default=5,
                       help="Base block size w (positions per step)")
-    core.add_argument("--max-iter", type=int, default=100000,
+    core.add_argument("--max-iter", type=int, default=1000000,
                       help="Maximum hill-climbing iterations T")
     core.add_argument("--output", type=str, default=None,
                       help="CSV output path")
@@ -1768,9 +1765,9 @@ Examples:
                      help="Tier 4: ILS perturbation restarts")
     opt.add_argument("--perturb-strength", type=int, default=30,
                      help="Positions to reassign per perturbation")
-    opt.add_argument("--perturb-patience", type=int, default=100,
+    opt.add_argument("--perturb-patience", type=int, default=50,
                      help="Iters stuck before perturbing")
-    opt.add_argument("--perturb-max", type=int, default=500,
+    opt.add_argument("--perturb-max", type=int, default=50,
                      help="Maximum perturbations per key")
     opt.add_argument("--perturb-score-guided", action="store_true",
                      help="Bias perturbation targets toward uncertain "
