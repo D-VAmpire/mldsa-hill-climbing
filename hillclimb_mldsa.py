@@ -2071,7 +2071,7 @@ Examples:
                      help="Positions to reassign per perturbation")
     opt.add_argument("--perturb-patience", type=int, default=50,
                      help="Iters stuck before perturbing")
-    opt.add_argument("--perturb-max", type=int, default=50,
+    opt.add_argument("--perturb-max", type=int, default=150,
                      help="Maximum perturbations per key")
     opt.add_argument("--perturb-score-guided", action="store_true",
                      help="Bias perturbation targets toward uncertain "
