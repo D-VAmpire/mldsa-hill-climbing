@@ -1544,6 +1544,14 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
         print(f"  Gurobi ILP fallback: enabled "
               f"(timeout={args.gurobi_timeout}s{norel_str}{pool_str})")
 
+    if args.gurobi:
+        norel_str = (f", norel={args.gurobi_norel_time}s"
+                     if args.gurobi_norel_time > 0 else "")
+        pool_str = (f", pool={args.gurobi_solution_limit}"
+                    if args.gurobi_solution_limit > 1 else "")
+        print(f"  Gurobi ILP fallback: enabled "
+              f"(timeout={args.gurobi_timeout}s{norel_str}{pool_str})")
+
     mode_desc = {"count": "count (violation count, L0)",
                  "excess": "excess (sum of constraint excesses, L1)",
                  "combined": (f"combined (lambda={fitness_lambda:.1f}, "
