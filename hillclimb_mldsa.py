@@ -308,10 +308,10 @@ def generate_informative_relations(rng, x_true, r_target, params,
 
         # --- Rejection sampling ---
         mask_accept = (z_batch > -reject_bound) & (z_batch < reject_bound)
-        total_signatures += int(np.sum(mask_accept))
 
         idx_acc = np.nonzero(mask_accept)[0]
-        if len(idx_acc) == 0:
+        n_accepted_batch = len(idx_acc)
+        if n_accepted_batch == 0:
             continue
 
         z_acc = z_batch[idx_acc]
@@ -343,6 +343,7 @@ def generate_informative_relations(rng, x_true, r_target, params,
         mask_inf = np.abs(z_bar) > threshold
         idx_inf = np.nonzero(mask_inf)[0]
         if len(idx_inf) == 0:
+            total_signatures += n_accepted_batch
             continue
 
         z_bar_inf = z_bar[idx_inf]
@@ -360,10 +361,19 @@ def generate_informative_relations(rng, x_true, r_target, params,
         n_new = len(z_bar_inf)
         need = r_target - n_collected
         if n_new > need:
+            # Only the first `need` informative relations are kept.
+            # Count accepted signatures up to (and including) the last
+            # accepted sample that produced the `need`-th informative
+            # relation.  idx_inf indexes into the accepted array, so
+            # idx_inf[need-1] is the position of the last needed
+            # informative within the accepted batch.
+            total_signatures += int(idx_inf[need - 1]) + 1
             z_bar_inf = z_bar_inf[:need]
             c_idx_inf = c_idx_inf[:need]
             c_signs_inf = c_signs_inf[:need]
             n_new = need
+        else:
+            total_signatures += n_accepted_batch
 
         C_new = np.zeros((n_new, n), dtype=np.int8)
         rows = np.repeat(np.arange(n_new), tau)
@@ -447,17 +457,36 @@ def compute_diversified_weights(base_weights, freq_counts,
 # ===================================================================
 # Fitness computation
 # ===================================================================
-def _compute_fitness_scalar(ip, lb, ub, fitness_mode, fitness_lambda):
+def _compute_fitness_scalar(ip, lb, ub, fitness_mode, fitness_lambda,
+                            modulus=None):
     """
     Compute scalar fitness value and violation count for a single candidate.
 
     Parameters:
         ip: (R,) inner product vector C @ x
         lb, ub: (R,) constraint bounds
+        modulus: if not None, check constraints modulo this value
+                 (centered residual must lie within [-half_width, half_width])
 
     Returns:
         (fitness_value, F_count)
     """
+    if modulus is not None:
+        z_center = 0.5 * (lb + ub)
+        half_width = 0.5 * (ub - lb)
+        residual = ip.astype(np.float64) - z_center
+        corrected = residual - modulus * np.round(residual / modulus)
+        abs_corr = np.abs(corrected)
+        violated = abs_corr > half_width
+        F = int(np.count_nonzero(violated))
+        if fitness_mode == "count":
+            return float(F), F
+        excess_total = float(np.sum(
+            np.maximum(abs_corr - half_width, 0.0)))
+        if fitness_mode == "excess":
+            return excess_total, F
+        return fitness_lambda * F + excess_total, F
+
     violated = (ip < lb) | (ip > ub)
     F = int(np.count_nonzero(violated))
     if fitness_mode == "count":
@@ -471,18 +500,39 @@ def _compute_fitness_scalar(ip, lb, ub, fitness_mode, fitness_lambda):
     return fitness_lambda * F + excess_total, F
 
 
-def _compute_fitness_batch(ip_batch, lb, ub, fitness_mode, fitness_lambda):
+def _compute_fitness_batch(ip_batch, lb, ub, fitness_mode, fitness_lambda,
+                           modulus=None):
     """
     Compute fitness values and violation counts for a batch of candidates.
 
     Parameters:
         ip_batch: (R, num_candidates) inner products
         lb, ub:   (R,) bounds
+        modulus:  if not None, check constraints modulo this value
 
     Returns:
         fitness:  (num_candidates,) float64
         F_counts: (num_candidates,) int
     """
+    if modulus is not None:
+        z_center = 0.5 * (lb + ub)                          # (R,)
+        half_width = 0.5 * (ub - lb)                         # (R,)
+        residual = ip_batch - z_center[:, np.newaxis]        # (R, nc)
+        corrected = residual - modulus * np.round(residual / modulus)
+        abs_corr = np.abs(corrected)
+        violated = abs_corr > half_width[:, np.newaxis]
+        F_counts = np.count_nonzero(violated, axis=0)
+
+        if fitness_mode == "count":
+            return F_counts.astype(np.float64), F_counts
+
+        excess = np.maximum(abs_corr - half_width[:, np.newaxis], 0.0)
+        S_vals = np.sum(excess, axis=0)
+
+        if fitness_mode == "excess":
+            return S_vals, F_counts
+        return fitness_lambda * F_counts + S_vals, F_counts
+
     violated = (ip_batch < lb[:, np.newaxis]) | (ip_batch > ub[:, np.newaxis])
     F_counts = np.count_nonzero(violated, axis=0)
 
@@ -503,12 +553,13 @@ def _compute_fitness_batch(ip_batch, lb, ub, fitness_mode, fitness_lambda):
 # Phase 2: Hill-climbing with optional optimizations
 # ===================================================================
 def _evaluate_candidate_chunk(C_block, ip_base, lb, ub, candidate_chunk,
-                              chunk_offset, fitness_mode, fitness_lambda):
+                              chunk_offset, fitness_mode, fitness_lambda,
+                              modulus=None):
     """Evaluate fitness for a chunk of candidate assignments (thread worker)."""
     new_contrib = C_block @ candidate_chunk.astype(np.int32).T
     ip_new = ip_base[:, np.newaxis] + new_contrib
     fitness, F_counts = _compute_fitness_batch(
-        ip_new, lb, ub, fitness_mode, fitness_lambda
+        ip_new, lb, ub, fitness_mode, fitness_lambda, modulus=modulus
     )
     best_local = int(np.argmin(fitness))
     return (chunk_offset + best_local,
@@ -524,7 +575,7 @@ def _precompute_candidates(values, w):
 
 
 def enumerate_feasible_keys(C_i32, x_start, lb, ub, params,
-                            max_keys=100, verbose=True):
+                            max_keys=100, verbose=True, modulus=None):
     """Enumerate feasible keys reachable from x_start via distance-1 steps.
 
     Starting from a solution with F=0, iteratively tests all (2*eta+1)
@@ -544,6 +595,7 @@ def enumerate_feasible_keys(C_i32, x_start, lb, ub, params,
         params:     ML-DSA parameter dict
         max_keys:   maximum number of feasible keys to enumerate
         verbose:    print progress
+        modulus:    if not None, check constraints modulo this value
 
     Returns:
         feasible_keys:  list of (n,) int8 arrays, including x_start
@@ -551,6 +603,19 @@ def enumerate_feasible_keys(C_i32, x_start, lb, ub, params,
     n = params["n"]
     eta = params["eta"]
     values = np.arange(-eta, eta + 1, dtype=np.int8)
+
+    # Precompute modular feasibility check helpers
+    if modulus is not None:
+        z_center = 0.5 * (lb + ub)
+        half_width = 0.5 * (ub - lb)
+
+        def _is_feasible(ip_test):
+            residual = ip_test.astype(np.float64) - z_center
+            corrected = residual - modulus * np.round(residual / modulus)
+            return np.all(np.abs(corrected) <= half_width)
+    else:
+        def _is_feasible(ip_test):
+            return np.all((ip_test >= lb) & (ip_test <= ub))
 
     start_tuple = tuple(x_start.tolist())
     ip_start = C_i32 @ x_start.astype(np.int32)
@@ -575,7 +640,7 @@ def enumerate_feasible_keys(C_i32, x_start, lb, ub, params,
                 if v == x_curr[j]:
                     continue
                 ip_test = ip_base_j + c_j * int(v)
-                if np.all((ip_test >= lb) & (ip_test <= ub)):
+                if _is_feasible(ip_test):
                     x_new = x_curr.copy()
                     x_new[j] = v
                     new_tuple = tuple(x_new.tolist())
@@ -595,7 +660,8 @@ def enumerate_feasible_keys(C_i32, x_start, lb, ub, params,
 
 
 def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
-                     position_indices, fitness_mode, fitness_lambda):
+                     position_indices, fitness_mode, fitness_lambda,
+                     modulus=None):
     """Evaluate all (2*eta+1) candidates for each position in a batch.
 
     Each position is tested independently against the frozen inner-product
@@ -610,6 +676,7 @@ def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
         position_indices: array of position indices to test
         fitness_mode:     fitness mode string
         fitness_lambda:   fitness lambda value
+        modulus:          if not None, check constraints modulo this value
 
     Returns:
         List of (position_index, best_value, best_fitness) for each position.
@@ -624,7 +691,8 @@ def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
         ip_candidates = ip_base_j[:, np.newaxis] + np.outer(c_j, vals_i32)
 
         fitness_vals, _ = _compute_fitness_batch(
-            ip_candidates, lb, ub, fitness_mode, fitness_lambda)
+            ip_candidates, lb, ub, fitness_mode, fitness_lambda,
+            modulus=modulus)
 
         best_idx = int(np.argmin(fitness_vals))
         results.append((int(j), int(values[best_idx]),
@@ -637,6 +705,8 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
               true_key=None, verbose=True, print_keys=False, num_workers=1,
               # Fitness mode
               fitness_mode="excess", fitness_lambda=None,
+              # Modular constraint checking
+              modulus=None,
               # Tier 1: Score-guided sampling
               score_weights=None,
               # Tier 2: Adaptive block size / VNS
@@ -751,7 +821,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
     x_curr = x_init.copy()
     ip = C_i32 @ x_curr.astype(np.int32)
     fitness_curr, F_curr = _compute_fitness_scalar(
-        ip, lb, ub, fitness_mode, fitness_lambda)
+        ip, lb, ub, fitness_mode, fitness_lambda, modulus=modulus)
 
     # History and logging
     history = []
@@ -818,7 +888,8 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                         -eta, eta + 1, size=p, dtype=np.int8)
                     ip = C_i32 @ x_curr.astype(np.int32)
                     fitness_curr, F_curr = _compute_fitness_scalar(
-                        ip, lb, ub, fitness_mode, fitness_lambda)
+                        ip, lb, ub, fitness_mode, fitness_lambda,
+                        modulus=modulus)
                     _reset_soft_state()
 
                     D_now = (int(np.sum(x_curr != true_key))
@@ -852,7 +923,8 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                         executor.submit(
                             _w1_sweep_worker, C_i32, ip_frozen, x_curr,
                             lb, ub, values, chunk,
-                            fitness_mode, fitness_lambda)
+                            fitness_mode, fitness_lambda,
+                            modulus)
                         for chunk in chunks
                     ]
                     all_results = []
@@ -861,7 +933,8 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                 else:
                     all_results = _w1_sweep_worker(
                         C_i32, ip_frozen, x_curr, lb, ub, values,
-                        all_positions, fitness_mode, fitness_lambda)
+                        all_positions, fitness_mode, fitness_lambda,
+                        modulus=modulus)
 
                 # Apply only strictly improving changes.  Since
                 # fitness_vals[curr_idx] = fitness_curr exactly (substituting
@@ -877,7 +950,8 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                 if num_changed > 0:
                     ip = C_i32 @ x_curr.astype(np.int32)
                     fitness_new, F_new = _compute_fitness_scalar(
-                        ip, lb, ub, fitness_mode, fitness_lambda)
+                        ip, lb, ub, fitness_mode, fitness_lambda,
+                        modulus=modulus)
                     sweep_improved = fitness_new < fitness_curr
                     fitness_curr = fitness_new
                     F_curr = F_new
@@ -963,7 +1037,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                     executor.submit(
                         _evaluate_candidate_chunk,
                         C_block, ip_base, lb, ub, chunk, offset,
-                        fitness_mode, fitness_lambda)
+                        fitness_mode, fitness_lambda, modulus)
                     for chunk, offset in zip(chunks, chunk_offsets)
                 ]
                 best_idx, fitness_best, F_best = min(
@@ -971,7 +1045,8 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
             else:
                 ip_new = ip_base[:, np.newaxis] + C_block @ candidates_i32T
                 fitness_vals, F_counts = _compute_fitness_batch(
-                    ip_new, lb, ub, fitness_mode, fitness_lambda)
+                    ip_new, lb, ub, fitness_mode, fitness_lambda,
+                    modulus=modulus)
                 best_idx = int(np.argmin(fitness_vals))
                 fitness_best = float(fitness_vals[best_idx])
                 F_best = int(F_counts[best_idx])
@@ -1516,7 +1591,8 @@ def _write_csv(results, csv_path):
 
 
 def _print_experiment_banner(args, params, beta_eff, fitness_mode,
-                             fitness_lambda, opt_flags, verbose):
+                             fitness_lambda, opt_flags, verbose,
+                             modulus=None):
     """Print the experiment configuration banner."""
     beta = params["eta"] * params["tau"]
 
@@ -1525,6 +1601,8 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
     if beta_eff < beta:
         print(f"  Effective error bound: beta_eff={beta_eff} "
               f"(< beta={beta}, j-independence transform skipped)")
+        if modulus is not None:
+            print(f"  Modular constraints: enabled (mod {modulus})")
     print(f"  Informative relations: {args.inf_rels}")
     print(f"  Block size w: {args.block_size}")
     print(f"  Max iterations T: {args.max_iter}")
@@ -1600,7 +1678,7 @@ def _evaluate_key_result(x_final, F_final, iters_used, num_perturbs,
                          key_idx, R, total_sigs,
                          init_correct, init_accuracy, D_init,
                          fitness_mode, fitness_lambda, opt_flags,
-                         verbose, print_keys):
+                         verbose, print_keys, modulus=None):
     """Evaluate hill-climbing result, run solver fallbacks, return result dict.
 
     Handles three outcome paths:
@@ -1629,7 +1707,8 @@ def _evaluate_key_result(x_final, F_final, iters_used, num_perturbs,
         ub_enum = z_tilde + beta_eff
         feasible_keys = enumerate_feasible_keys(
             C_i32, x_final, lb_enum, ub_enum, params,
-            max_keys=args.max_alt_keys, verbose=verbose)
+            max_keys=args.max_alt_keys, verbose=verbose,
+            modulus=modulus)
         alt_keys_found = len(feasible_keys)
 
         # The true key check is simulation-only bookkeeping.
@@ -1829,6 +1908,12 @@ def run_experiment(args):
     fitness_lambda = (args.fitness_lambda if args.fitness_lambda is not None
                       else float(beta_eff))
 
+    # Modular constraint checking: when beta_eff < beta, the LWE relations
+    # are modular (mod 2^{ell+1}) and wrapping can occur for large inner
+    # products.  The fitness functions must use centered modular residuals.
+    beta = params["eta"] * params["tau"]
+    modulus = (int(2 ** (args.leakage + 1)) if beta_eff < beta else None)
+
     # Resolve --all-optimizations / --default-optimizations into individual flags
     all_opt = args.all_optimizations
     dflt_opt = args.default_optimizations
@@ -1842,7 +1927,8 @@ def run_experiment(args):
     )
 
     _print_experiment_banner(args, params, beta_eff, fitness_mode,
-                             fitness_lambda, opt_flags, verbose)
+                             fitness_lambda, opt_flags, verbose,
+                             modulus=modulus)
 
     csv_path = Path(args.output) if args.output else None
     if csv_path:
@@ -1916,6 +2002,7 @@ def run_experiment(args):
                 true_key=x_true, verbose=verbose, print_keys=print_keys,
                 num_workers=args.workers,
                 fitness_mode=fitness_mode, fitness_lambda=fitness_lambda,
+                modulus=modulus,
                 score_weights=score_weights,
                 use_adaptive_w=opt_flags["adaptive_w"],
                 adaptive_w_max=args.adaptive_w_max,
@@ -1941,7 +2028,7 @@ def run_experiment(args):
                 key_idx, R, total_sigs,
                 init_correct, init_accuracy, D_init,
                 fitness_mode, fitness_lambda, opt_flags,
-                verbose, print_keys)
+                verbose, print_keys, modulus=modulus)
             results.append(result)
             print()
 
