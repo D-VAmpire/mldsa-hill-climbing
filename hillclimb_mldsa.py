@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hill-Climbing Key Recovery for ML-DSA via Verification Fitness Oracle (v7)
+Hill-Climbing Key Recovery for ML-DSA via Verification Fitness Oracle (v8)
 
 Solves the Leaky-Signature-LWE problem (Damm et al., "One Bit to Rule Them
 All") by hill-climbing over a verification fitness oracle.  Phase 1 performs
@@ -8,7 +8,7 @@ relation extraction and the j-independence transformation to produce Integer
 LWE relations; Phase 2 uses OLS regression for a warm start, then iteratively
 minimises a fitness function over the coefficient space.
 
-Optional MOSEK ILP fallback (--mosek):
+Optional MOSEK ILP fallback (--mosek) (currently disabled):
   When hill climbing exhausts --max-iter without recovering the key, the best
   intermediate solution x' is handed to MOSEK's mixed-integer optimizer as a
   warm start for an Integer Linear Program.  The ILP encodes *all* verification
@@ -22,7 +22,7 @@ Optional MOSEK ILP fallback (--mosek):
 
   Requires the MOSEK Python package (``pip install Mosek``) and a valid license.
 
-Optional Gurobi ILP fallback (--gurobi):
+Optional Gurobi ILP fallback (--gurobi) (currently disabled):
   Alternative ILP fallback using Gurobi as a pure feasibility solver (no
   objective function).  The hill-climbing estimate x' is injected via Gurobi's
   VarHintVal mechanism, which guides both heuristics and branching decisions
@@ -52,7 +52,7 @@ Fitness modes (--fitness):
     M(x) = lambda * F(x) + S(x).
     Fixed penalty lambda per violated equation plus its excess.
     Interpolates between pure excess (lambda=0) and count-dominated
-    (lambda >> 1). Default lambda = beta = eta * tau.
+    (lambda >> 1). Default lambda = beta_eff = min(eta * tau, 2^{ell-1}).
 
 Optimization strategies (all independently toggleable):
 
@@ -63,8 +63,8 @@ Optimization strategies (all independently toggleable):
   Tier 2 -- Adaptive block size / VNS (--adaptive-w):
     Variable Neighborhood Search: increases w when stuck, resets on progress.
 
-  Tier 3a -- Accept lateral moves with tabu (--lateral-moves):
-    Accepts F' == F to drift along plateaus; lightweight tabu prevents cycling.
+  Tier 3a -- Accept lateral moves (--lateral-moves):
+    Accepts F' == F to drift along plateaus.
 
   Tier 3b -- Frequency-based diversification (--diversify):
     Biases selection toward under-explored positions; periodic forced sweeps
@@ -75,13 +75,16 @@ Optimization strategies (all independently toggleable):
     p positions to break compensating error clusters, then restarts local search.
     Best-ever solution is tracked across all perturbation rounds.
 
-  Tier 5 -- Sequential position selection (--sequential-w):
-    Instead of random position sampling, maintains a pool of available
-    positions that is consumed for w_base, ensuring every position is tested
-    before moving to higher w.  This systematically harvests low-hanging fruit
-    at low w before committing to the exponentially more expensive higher w.
+  Tier 5 -- w=1 sweep preamble (--sequential-w):
+    Before each adaptive search phase, performs a batch parallel sweep over
+    all n positions at block size w=1.  Positions are tested independently
+    against a frozen snapshot of the current solution, then all improving
+    changes are applied simultaneously.  Each full sweep counts as one
+    iteration.  The sweep repeats until no further single-position
+    improvements exist, then transitions to adaptive block search.
 
   --all-optimizations: Enables all of the above.
+  --default-optimizations: Enables all except score-guided (recommended).
 
 Graceful interruption:
   Ctrl+C during execution will finish the current iteration, then print
@@ -91,12 +94,12 @@ Graceful interruption:
   Model.terminate().
 
 Usage:
-  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 5
-  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 5 \\
+  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 2
+  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 2 \\
       --all-optimizations --mosek --mosek-timeout 120
-  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 5 \\
+  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 2 \\
       --all-optimizations --gurobi --gurobi-timeout 120 --gurobi-norel-time 30
-  python hillclimb_mldsa.py --params 44 --inf-rels 15000 --block-size 5 \\
+  python hillclimb_mldsa.py --params 44 --inf-rels 15000 --block-size 2 \\
       --gurobi --gurobi-solution-limit 10
 """
 
@@ -107,7 +110,6 @@ import sys
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from itertools import product as cartesian_product
 from pathlib import Path
 from time import perf_counter
 
@@ -245,6 +247,11 @@ def generate_informative_relations(rng, x_true, r_target, params,
     a realistic side channel where the attacker reads but does not control
     the randomness.
 
+    This implementation is fully vectorized: each batch of signatures is
+    processed via numpy operations without Python-level per-sample loops.
+    The scalar functions get_bit, mod_centered, extract_lwe_relation above
+    serve as the reference implementation for the algorithm.
+
     Parameters:
         rng:            numpy random generator
         x_true:         (n,) true partial key (int8)
@@ -264,56 +271,120 @@ def generate_informative_relations(rng, x_true, r_target, params,
     beta = eta * tau
     ell = leakage_index
 
-    z_values = []
-    challenge_rows = []
+    # Precompute constants for the relation extraction
+    M = np.int64(2 ** (ell + 1))      # centered-mod modulus
+    H = np.int64(2 ** ell)            # half-modulus
+    Q = np.int64(2 ** (ell - 1))      # quarter-modulus
+    threshold = Q - beta               # informativity: |z_bar| > threshold
+    reject_bound = np.int64(gamma - beta)
+
+    n_collected = 0
+    z_collected = []
+    C_collected = []
     total_signatures = 0
     batch_size = max(r_target, 1000)
 
-    while len(z_values) < r_target:
-        remaining = r_target - len(z_values)
+    while n_collected < r_target:
+        remaining = r_target - n_collected
         n_batch = max(remaining * 5, batch_size)
+
+        # --- Batch sample generation ---
         y_batch = rng.integers(-(gamma - 1), gamma, size=n_batch,
                                dtype=np.int64)
+        y_j_batch = (y_batch >> ell) & 1               # leaked bit (Eq. 7)
 
-        for y_raw in y_batch:
-            if len(z_values) >= r_target:
-                break
+        # Challenge vectors: tau distinct random positions per sample.
+        # argpartition of random floats is equivalent to rng.choice(n, tau,
+        # replace=False) per row, but fully vectorized.
+        rand = rng.random((n_batch, n))
+        c_idx_batch = np.argpartition(rand, tau, axis=1)[:, :tau]
+        c_signs_batch = (2 * rng.integers(0, 2, size=(n_batch, tau),
+                                          dtype=np.int8) - 1)
 
-            y = int(y_raw)
-            y_j = get_bit(y, ell)
+        # Inner product <c, x_true> and signature coefficient z = y + <c, x>
+        cx_batch = np.sum(x_true[c_idx_batch] * c_signs_batch, axis=1,
+                          dtype=np.int64)
+        z_batch = y_batch + cx_batch
 
-            c_idx = rng.choice(n, size=tau, replace=False)
-            c_signs = rng.choice([-1, 1], size=tau).astype(np.int8)
+        # --- Rejection sampling ---
+        mask_accept = (z_batch > -reject_bound) & (z_batch < reject_bound)
 
-            cx = int(np.dot(x_true[c_idx], c_signs))
-            z = y + cx
+        idx_acc = np.nonzero(mask_accept)[0]
+        n_accepted_batch = len(idx_acc)
+        if n_accepted_batch == 0:
+            continue
 
-            # Mimic rejection sampling
-            if not (-(gamma - beta) < z < (gamma - beta)):
-                continue
+        z_acc = z_batch[idx_acc]
+        y_j_acc = y_j_batch[idx_acc]
+        c_idx_acc = c_idx_batch[idx_acc]
+        c_signs_acc = c_signs_batch[idx_acc]
 
-            total_signatures += 1
+        # --- Vectorized LWE relation extraction (Eq. 6, 7, 10) ---
+        # Step 1: centered mod and bit test (Eq. 6 branching)
+        z_raw = z_acc % M
+        z_mod = np.where(z_raw > H, z_raw - M, z_raw)
+        bit_j = (z_mod >> ell) & 1
 
-            z_bar = extract_lwe_relation(z, ell, y_j)
+        # Step 2: rotate and derive b_j (Eq. 6 & 7)
+        z_up = np.where(bit_j == 1, z_acc + Q, z_acc - Q)
+        b_j = np.where(bit_j == 1, y_j_acc, y_j_acc ^ 1)
 
-            # Informativity filter
-            if abs(z_bar) <= 2 ** (ell - 1) - beta:
-                continue
+        # Step 3: final z_bar via three-way branch (Eq. 10)
+        z_up_raw = z_up % M
+        z_up_mod = np.where(z_up_raw > H, z_up_raw - M, z_up_raw)
+        bit_j_up = (z_up >> ell) & 1
 
-            # j-independence transformation (Eq. 3)
-            if 2 ** (ell - 1) > beta:
-                if z_bar > 2 ** (ell - 1) - beta:
-                    z_bar -= 2 ** (ell - 1) - beta
-                else:
-                    z_bar += 2 ** (ell - 1) - beta
+        z_bar = np.where(
+            b_j == 1,
+            z_up_mod,
+            np.where(bit_j_up == 1, z_up_mod + H, z_up_mod - H))
 
-            c_dense = np.zeros(n, dtype=np.int8)
-            c_dense[c_idx] = c_signs
-            challenge_rows.append(c_dense)
-            z_values.append(z_bar)
+        # --- Informativity filter ---
+        mask_inf = np.abs(z_bar) > threshold
+        idx_inf = np.nonzero(mask_inf)[0]
+        if len(idx_inf) == 0:
+            total_signatures += n_accepted_batch
+            continue
 
-    z_tilde = np.array(z_values[:r_target], dtype=np.float64)
-    C = np.array(challenge_rows[:r_target], dtype=np.int8)
+        z_bar_inf = z_bar[idx_inf]
+        c_idx_inf = c_idx_acc[idx_inf]
+        c_signs_inf = c_signs_acc[idx_inf]
+
+        # --- j-independence transformation (Eq. 3) ---
+        if Q > beta:
+            shift = np.int64(Q - beta)
+            z_bar_inf = np.where(z_bar_inf > shift,
+                                 z_bar_inf - shift,
+                                 z_bar_inf + shift)
+
+        # --- Trim to what we still need and build dense challenge rows ---
+        n_new = len(z_bar_inf)
+        need = r_target - n_collected
+        if n_new > need:
+            # Only the first `need` informative relations are kept.
+            # Count accepted signatures up to (and including) the last
+            # accepted sample that produced the `need`-th informative
+            # relation.  idx_inf indexes into the accepted array, so
+            # idx_inf[need-1] is the position of the last needed
+            # informative within the accepted batch.
+            total_signatures += int(idx_inf[need - 1]) + 1
+            z_bar_inf = z_bar_inf[:need]
+            c_idx_inf = c_idx_inf[:need]
+            c_signs_inf = c_signs_inf[:need]
+            n_new = need
+        else:
+            total_signatures += n_accepted_batch
+
+        C_new = np.zeros((n_new, n), dtype=np.int8)
+        rows = np.repeat(np.arange(n_new), tau)
+        C_new[rows, c_idx_inf.ravel()] = c_signs_inf.ravel()
+
+        z_collected.append(z_bar_inf)
+        C_collected.append(C_new)
+        n_collected += n_new
+
+    z_tilde = np.concatenate(z_collected)[:r_target].astype(np.float64)
+    C = np.vstack(C_collected)[:r_target]
     return z_tilde, C, total_signatures
 
 
@@ -386,17 +457,36 @@ def compute_diversified_weights(base_weights, freq_counts,
 # ===================================================================
 # Fitness computation
 # ===================================================================
-def _compute_fitness_scalar(ip, lb, ub, fitness_mode, fitness_lambda):
+def _compute_fitness_scalar(ip, lb, ub, fitness_mode, fitness_lambda,
+                            modulus=None):
     """
     Compute scalar fitness value and violation count for a single candidate.
 
     Parameters:
         ip: (R,) inner product vector C @ x
         lb, ub: (R,) constraint bounds
+        modulus: if not None, check constraints modulo this value
+                 (centered residual must lie within [-half_width, half_width])
 
     Returns:
         (fitness_value, F_count)
     """
+    if modulus is not None:
+        z_center = 0.5 * (lb + ub)
+        half_width = 0.5 * (ub - lb)
+        residual = ip.astype(np.float64) - z_center
+        corrected = residual - modulus * np.round(residual / modulus)
+        abs_corr = np.abs(corrected)
+        violated = abs_corr > half_width
+        F = int(np.count_nonzero(violated))
+        if fitness_mode == "count":
+            return float(F), F
+        excess_total = float(np.sum(
+            np.maximum(abs_corr - half_width, 0.0)))
+        if fitness_mode == "excess":
+            return excess_total, F
+        return fitness_lambda * F + excess_total, F
+
     violated = (ip < lb) | (ip > ub)
     F = int(np.count_nonzero(violated))
     if fitness_mode == "count":
@@ -410,18 +500,39 @@ def _compute_fitness_scalar(ip, lb, ub, fitness_mode, fitness_lambda):
     return fitness_lambda * F + excess_total, F
 
 
-def _compute_fitness_batch(ip_batch, lb, ub, fitness_mode, fitness_lambda):
+def _compute_fitness_batch(ip_batch, lb, ub, fitness_mode, fitness_lambda,
+                           modulus=None):
     """
     Compute fitness values and violation counts for a batch of candidates.
 
     Parameters:
         ip_batch: (R, num_candidates) inner products
         lb, ub:   (R,) bounds
+        modulus:  if not None, check constraints modulo this value
 
     Returns:
         fitness:  (num_candidates,) float64
         F_counts: (num_candidates,) int
     """
+    if modulus is not None:
+        z_center = 0.5 * (lb + ub)                          # (R,)
+        half_width = 0.5 * (ub - lb)                         # (R,)
+        residual = ip_batch - z_center[:, np.newaxis]        # (R, nc)
+        corrected = residual - modulus * np.round(residual / modulus)
+        abs_corr = np.abs(corrected)
+        violated = abs_corr > half_width[:, np.newaxis]
+        F_counts = np.count_nonzero(violated, axis=0)
+
+        if fitness_mode == "count":
+            return F_counts.astype(np.float64), F_counts
+
+        excess = np.maximum(abs_corr - half_width[:, np.newaxis], 0.0)
+        S_vals = np.sum(excess, axis=0)
+
+        if fitness_mode == "excess":
+            return S_vals, F_counts
+        return fitness_lambda * F_counts + S_vals, F_counts
+
     violated = (ip_batch < lb[:, np.newaxis]) | (ip_batch > ub[:, np.newaxis])
     F_counts = np.count_nonzero(violated, axis=0)
 
@@ -442,12 +553,13 @@ def _compute_fitness_batch(ip_batch, lb, ub, fitness_mode, fitness_lambda):
 # Phase 2: Hill-climbing with optional optimizations
 # ===================================================================
 def _evaluate_candidate_chunk(C_block, ip_base, lb, ub, candidate_chunk,
-                              chunk_offset, fitness_mode, fitness_lambda):
+                              chunk_offset, fitness_mode, fitness_lambda,
+                              modulus=None):
     """Evaluate fitness for a chunk of candidate assignments (thread worker)."""
     new_contrib = C_block @ candidate_chunk.astype(np.int32).T
     ip_new = ip_base[:, np.newaxis] + new_contrib
     fitness, F_counts = _compute_fitness_batch(
-        ip_new, lb, ub, fitness_mode, fitness_lambda
+        ip_new, lb, ub, fitness_mode, fitness_lambda, modulus=modulus
     )
     best_local = int(np.argmin(fitness))
     return (chunk_offset + best_local,
@@ -457,39 +569,171 @@ def _evaluate_candidate_chunk(C_block, ip_base, lb, ub, candidate_chunk,
 
 def _precompute_candidates(values, w):
     """Precompute all (2*eta+1)^w candidate tuples for a given block size."""
-    return np.array(list(cartesian_product(values, repeat=w)), dtype=np.int8)
+    nv = len(values)
+    indices = np.indices((nv,) * w).reshape(w, -1).T    # (nv^w, w)
+    return values[indices]                                # (nv^w, w), same dtype as values
 
 
-def hillclimb(C, z_tilde, x_init, params, rng, w, T,
+def enumerate_feasible_keys(C_i32, x_start, lb, ub, params,
+                            max_keys=100, verbose=True, modulus=None):
+    """Enumerate feasible keys reachable from x_start via distance-1 steps.
+
+    Starting from a solution with F=0, iteratively tests all (2*eta+1)
+    candidate values for each of the n positions.  Any candidate that also
+    gives F=0 and differs from the current value defines a new feasible key
+    at Hamming distance 1.  The search continues BFS-style from each newly
+    discovered key until no more new keys are found or max_keys is reached.
+
+    Performance note: each BFS node uses rank-1 inner-product updates per
+    position, but still O(R) per candidate test.  For max_keys up to ~100
+    this is negligible; very large values (>1000) may take noticeable time.
+
+    Parameters:
+        C_i32:      (R, n) int32 challenge matrix
+        x_start:    (n,) int8 starting solution with F=0
+        lb, ub:     (R,) constraint bounds
+        params:     ML-DSA parameter dict
+        max_keys:   maximum number of feasible keys to enumerate
+        verbose:    print progress
+        modulus:    if not None, check constraints modulo this value
+
+    Returns:
+        feasible_keys:  list of (n,) int8 arrays, including x_start
+    """
+    n = params["n"]
+    eta = params["eta"]
+    values = np.arange(-eta, eta + 1, dtype=np.int8)
+
+    # Precompute modular feasibility check helpers
+    if modulus is not None:
+        z_center = 0.5 * (lb + ub)
+        half_width = 0.5 * (ub - lb)
+
+        def _is_feasible(ip_test):
+            residual = ip_test.astype(np.float64) - z_center
+            corrected = residual - modulus * np.round(residual / modulus)
+            return np.all(np.abs(corrected) <= half_width)
+    else:
+        def _is_feasible(ip_test):
+            return np.all((ip_test >= lb) & (ip_test <= ub))
+
+    start_tuple = tuple(x_start.tolist())
+    ip_start = C_i32 @ x_start.astype(np.int32)
+
+    # found: tuple → np.array;  frontier: deque of (tuple, ip) pairs
+    found = {start_tuple: x_start.copy()}
+    frontier = deque([(start_tuple, ip_start)])
+
+    while frontier:
+        if len(found) >= max_keys:
+            break
+        key_tuple, ip_curr = frontier.popleft()
+        x_curr = found[key_tuple]
+
+        for j in range(n):
+            if len(found) >= max_keys:
+                break
+            c_j = C_i32[:, j]
+            ip_base_j = ip_curr - c_j * int(x_curr[j])
+
+            for v in values:
+                if v == x_curr[j]:
+                    continue
+                ip_test = ip_base_j + c_j * int(v)
+                if _is_feasible(ip_test):
+                    x_new = x_curr.copy()
+                    x_new[j] = v
+                    new_tuple = tuple(x_new.tolist())
+                    if new_tuple not in found:
+                        found[new_tuple] = x_new
+                        # Rank-1 update: ip_new = ip_curr + c_j * (v - x_curr[j])
+                        ip_new = ip_curr + c_j * (int(v) - int(x_curr[j]))
+                        frontier.append((new_tuple, ip_new))
+                        if len(found) >= max_keys:
+                            break
+
+    feasible_keys = list(found.values())
+    if verbose and len(feasible_keys) > 1:
+        print(f"  [ALT-KEY] Enumerated {len(feasible_keys)} feasible key(s) "
+              f"(cap={max_keys})")
+    return feasible_keys
+
+
+def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
+                     position_indices, fitness_mode, fitness_lambda,
+                     modulus=None):
+    """Evaluate all (2*eta+1) candidates for each position in a batch.
+
+    Each position is tested independently against the frozen inner-product
+    vector ip_frozen.  This is the thread worker for the parallel w=1 sweep.
+
+    Parameters:
+        C_i32:            (R, n) int32 challenge matrix
+        ip_frozen:        (R,) inner products at sweep start (frozen)
+        x_curr:           (n,) current solution (int8, read-only)
+        lb, ub:           (R,) constraint bounds
+        values:           (2*eta+1,) candidate values array
+        position_indices: array of position indices to test
+        fitness_mode:     fitness mode string
+        fitness_lambda:   fitness lambda value
+        modulus:          if not None, check constraints modulo this value
+
+    Returns:
+        List of (position_index, best_value, best_fitness) for each position.
+    """
+    vals_i32 = values.astype(np.int32)
+    results = []
+    for j in position_indices:
+        c_j = C_i32[:, j]                         # (R,)
+        ip_base_j = ip_frozen - c_j * int(x_curr[j])  # (R,)
+
+        # ip_base_j[:, None] + c_j[:, None] * vals_i32[None, :]  → (R, nvals)
+        ip_candidates = ip_base_j[:, np.newaxis] + np.outer(c_j, vals_i32)
+
+        fitness_vals, _ = _compute_fitness_batch(
+            ip_candidates, lb, ub, fitness_mode, fitness_lambda,
+            modulus=modulus)
+
+        best_idx = int(np.argmin(fitness_vals))
+        results.append((int(j), int(values[best_idx]),
+                         float(fitness_vals[best_idx])))
+    return results
+
+
+def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
               leakage_index,
               true_key=None, verbose=True, print_keys=False, num_workers=1,
               # Fitness mode
               fitness_mode="excess", fitness_lambda=None,
+              # Modular constraint checking
+              modulus=None,
               # Tier 1: Score-guided sampling
               score_weights=None,
               # Tier 2: Adaptive block size / VNS
               use_adaptive_w=False, adaptive_w_max=6, adaptive_w_patience=50,
               # Tier 3a: Lateral moves
-              use_lateral_moves=False, lateral_tabu_size=20,
+              use_lateral_moves=False,
               # Tier 3b: Frequency diversification
               use_diversify=False, diversify_strength=1.0, sweep_interval=0,
               # Tier 4: Iterated Local Search
               use_perturb_restart=False, perturb_strength=30,
               perturb_patience=100, perturb_max=500,
               perturb_score_guided=False,
-              # Tier 5: Sequential position selection
-              use_sequential_w=False):
+              # Tier 5: w=1 sweep preamble
+              use_w1_sweep=False,
+              w1_batch_size=16):
     """
     Hill-climbing key recovery using configurable fitness function,
     with optional optimization strategies including ILS.
 
-    Sequential position selection mode (--sequential-w):
-      When enabled, the algorithm maintains a pool of available positions for
-      each block size w.  Each iteration, w random positions are drawn from
-      the pool without replacement.  When the pool is exhausted (all n
-      positions have been tested at current w), w is incremented and the pool
-      is replenished.  This ensures every position is tested at low w before
-      committing to the exponentially costlier higher-w search.
+    w=1 sweep preamble (--sequential-w):
+      When enabled, the algorithm begins (and restarts after each improvement
+      or perturbation) with a batch parallel sweep over all n positions at
+      w=1.  All positions are tested independently against a frozen snapshot
+      of the current inner products, then all individually-improving changes
+      are applied simultaneously.  Each sweep counts as one iteration.
+      The sweep repeats until no positions improve, then transitions to
+      adaptive block size search starting at w = max(block_size, 2).
 
     Returns:
         x_final:           (n,) recovered key estimate
@@ -506,16 +750,23 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
         fitness_lambda = float(beta_eff)
 
     values = np.arange(-eta, eta + 1, dtype=np.int8)
-    w_base = w
-    w_curr = w
 
-    # Candidate tuple cache (keyed by block size)
-    candidate_cache = {w_curr: _precompute_candidates(values, w_curr)}
+    # When w=1 sweep is active, adaptive search starts at max(w, 2) after
+    # the sweep, since w=1 was already exhaustively covered.
+    w_adaptive_start = max(w, 2) if use_w1_sweep else w
+    w_curr = w_adaptive_start
+
+    # Candidate tuple cache (keyed by block size).
+    # Stores (int8_tuples, int32_transposed) to avoid per-iteration casts.
+    def _make_cached(block_size):
+        tuples = _precompute_candidates(values, block_size)
+        return tuples, tuples.astype(np.int32).T
+
+    candidate_cache = {w_curr: _make_cached(w_curr)}
 
     def get_candidates(block_size):
         if block_size not in candidate_cache:
-            candidate_cache[block_size] = _precompute_candidates(
-                values, block_size)
+            candidate_cache[block_size] = _make_cached(block_size)
         return candidate_cache[block_size]
 
     # ---------------------------------------------------------------
@@ -529,51 +780,40 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                        else None)
 
     # ---------------------------------------------------------------
-    # Sequential-w state
+    # w=1 sweep state
     # ---------------------------------------------------------------
-    seq_pool = {}       # w -> set of remaining position indices
-    seq_tried = {}      # w -> count of positions consumed so far
+    in_w1_sweep = use_w1_sweep
 
-    def _init_seq_pool(block_size):
-        """Initialise (or reset) the sequential pool for a given w."""
-        seq_pool[block_size] = set(range(n))
-        seq_tried[block_size] = 0
-
-    if use_sequential_w:
-        _init_seq_pool(w_base)
+    def _reset_w1_sweep():
+        """Re-enter the w=1 sweep phase."""
+        nonlocal in_w1_sweep, w_curr
+        in_w1_sweep = True
+        w_curr = 1  # will be set to w_adaptive_start when sweep finishes
 
     # ---------------------------------------------------------------
     # Mutable exploration state (reset on perturbation)
     # ---------------------------------------------------------------
     freq_counts = np.zeros(n, dtype=np.int64)
-    tabu_set = set()
-    tabu_queue = deque()
     sweep_permutation = None
     sweep_offset = 0
     iters_since_improvement = 0
 
     def _reset_soft_state():
         """Reset exploration state after a perturbation."""
-        nonlocal freq_counts, tabu_set, tabu_queue
+        nonlocal freq_counts
         nonlocal sweep_permutation, sweep_offset, w_curr
         nonlocal iters_since_improvement
         freq_counts[:] = 0
-        tabu_set.clear()
-        tabu_queue.clear()
         sweep_permutation = None
         sweep_offset = 0
-        w_curr = w_base
+        w_curr = w_adaptive_start
         iters_since_improvement = 0
-        # Reset sequential-w pools
-        if use_sequential_w:
-            seq_pool.clear()
-            seq_tried.clear()
-            _init_seq_pool(w_base)
+        if use_w1_sweep:
+            _reset_w1_sweep()
 
     # ---------------------------------------------------------------
     # Precompute constraint bounds (constant throughout)
     # ---------------------------------------------------------------
-    C_i32 = C.astype(np.int32)
     lb = z_tilde - beta_eff
     ub = z_tilde + beta_eff
 
@@ -581,7 +821,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
     x_curr = x_init.copy()
     ip = C_i32 @ x_curr.astype(np.int32)
     fitness_curr, F_curr = _compute_fitness_scalar(
-        ip, lb, ub, fitness_mode, fitness_lambda)
+        ip, lb, ub, fitness_mode, fitness_lambda, modulus=modulus)
 
     # History and logging
     history = []
@@ -616,6 +856,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
 
             # ===== Tier 4: ILS perturbation check =====
             if (use_perturb_restart
+                    and not in_w1_sweep
                     and iters_since_improvement >= perturb_patience):
                 adaptive_exhausted = ((not use_adaptive_w)
                                       or (w_curr >= adaptive_w_max))
@@ -647,7 +888,8 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                         -eta, eta + 1, size=p, dtype=np.int8)
                     ip = C_i32 @ x_curr.astype(np.int32)
                     fitness_curr, F_curr = _compute_fitness_scalar(
-                        ip, lb, ub, fitness_mode, fitness_lambda)
+                        ip, lb, ub, fitness_mode, fitness_lambda,
+                        modulus=modulus)
                     _reset_soft_state()
 
                     D_now = (int(np.sum(x_curr != true_key))
@@ -667,42 +909,94 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
             # ===== Position selection =====
             in_sweep = False
 
-            if use_sequential_w and (w_curr == w_base
-                                     or not use_adaptive_w):
-                # --- Sequential pool-based selection ---
-                # Check if pool is exhausted for current w
-                if not seq_pool.get(w_curr):
-                    new_w = min(w_curr + 1, adaptive_w_max, n)
-                    if new_w != w_curr:
-                        w_curr = new_w
-                        _init_seq_pool(w_curr)
-                        iters_since_improvement = 0
-                        if verbose:
-                            print(f"    [sequential-w] w expanded to {w_curr}  "
-                                  f"({(2*eta+1)**w_curr} candidates/step)")
-                        continue  # start fresh with new w next iteration
-                    else:
-                        # w is at max; trigger perturbation if enabled,
-                        # otherwise reset pool and keep going
-                        if (use_perturb_restart
-                                and num_perturbations < perturb_max):
-                            iters_since_improvement = perturb_patience
-                            continue
-                        else:
-                            _init_seq_pool(w_curr)
+            if in_w1_sweep:
+                # --- Batch parallel w=1 sweep (one iteration = all n positions) ---
+                all_positions = np.arange(n, dtype=int)
+                ip_frozen = ip.copy()
 
-                # Draw w random positions from the pool
-                available_list = list(seq_pool[w_curr])
-                num_to_pick = min(w_curr, len(available_list))
-                selected_indices = rng.choice(
-                    len(available_list), size=num_to_pick, replace=False)
-                positions = np.array(
-                    [available_list[i] for i in selected_indices], dtype=int)
+                # Split positions into chunks and evaluate in parallel
+                n_chunks = max(1, int(np.ceil(n / w1_batch_size)))
+                chunks = np.array_split(all_positions, n_chunks)
 
-                # Remove selected positions from pool
-                for pos in positions:
-                    seq_pool[w_curr].discard(pos)
-                seq_tried[w_curr] = seq_tried.get(w_curr, 0) + len(positions)
+                if use_parallel:
+                    futures = [
+                        executor.submit(
+                            _w1_sweep_worker, C_i32, ip_frozen, x_curr,
+                            lb, ub, values, chunk,
+                            fitness_mode, fitness_lambda,
+                            modulus)
+                        for chunk in chunks
+                    ]
+                    all_results = []
+                    for f in futures:
+                        all_results.extend(f.result())
+                else:
+                    all_results = _w1_sweep_worker(
+                        C_i32, ip_frozen, x_curr, lb, ub, values,
+                        all_positions, fitness_mode, fitness_lambda,
+                        modulus=modulus)
+
+                # Apply only strictly improving changes.  Since
+                # fitness_vals[curr_idx] = fitness_curr exactly (substituting
+                # the current value back into the frozen ip reproduces it),
+                # the strict '<' ensures correct positions are never touched.
+                num_changed = 0
+                for j, best_val, best_fit in all_results:
+                    if best_fit < fitness_curr and best_val != int(x_curr[j]):
+                        x_curr[j] = np.int8(best_val)
+                        num_changed += 1
+
+                # Recompute ip and fitness only if something changed
+                if num_changed > 0:
+                    ip = C_i32 @ x_curr.astype(np.int32)
+                    fitness_new, F_new = _compute_fitness_scalar(
+                        ip, lb, ub, fitness_mode, fitness_lambda,
+                        modulus=modulus)
+                    sweep_improved = fitness_new < fitness_curr
+                    fitness_curr = fitness_new
+                    F_curr = F_new
+                else:
+                    sweep_improved = False
+
+                # Logging
+                D_now = (int(np.sum(x_curr != true_key))
+                         if true_key is not None else -1)
+                history.append((t, F_curr, D_now))
+
+                if verbose:
+                    extra = (f", fitness={fitness_curr:.1f}"
+                             if fitness_mode != "count" else "")
+                    tag = " *" if sweep_improved else ""
+                    print(f"  Iter {t}: F={F_curr}, D={D_now}{tag}"
+                          f"  [w1-sweep: {num_changed} positions changed]"
+                          f"{extra}")
+                    if sweep_improved and print_keys:
+                        print(f"    x* = {format_key(x_curr)}")
+
+                # At F=0, remaining wrong positions are invisible to the
+                # fitness function; the caller handles uniqueness verification.
+                if F_curr == 0:
+                    break
+
+                if sweep_improved:
+                    # Track best-ever and restart sweep
+                    iters_since_improvement = 0
+                    if fitness_curr < fitness_best_ever:
+                        fitness_best_ever = fitness_curr
+                        F_best_ever = F_curr
+                        x_best_ever = x_curr.copy()
+                        ip_best_ever = ip.copy()
+                    _reset_w1_sweep()
+                else:
+                    # No improvement — transition to adaptive phase
+                    in_w1_sweep = False
+                    w_curr = w_adaptive_start
+                    iters_since_improvement = 0
+                    if verbose:
+                        print(f"    [w1-sweep] no improvement, transitioning "
+                              f"to adaptive w={w_curr}  "
+                              f"({(2*eta+1)**w_curr} candidates/step)")
+                continue  # sweep consumed this iteration
 
             elif sweep_interval > 0 and (t % sweep_interval) == 0:
                 # Tier 3b: forced deterministic sweep round
@@ -727,10 +1021,10 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
 
             # ===== Candidate evaluation (core inner loop) =====
             actual_w = len(positions)
-            candidate_tuples = get_candidates(actual_w)
+            candidate_tuples, candidates_i32T = get_candidates(actual_w)
             num_candidates = candidate_tuples.shape[0]
 
-            C_block = C[:, positions].astype(np.int32)
+            C_block = C_i32[:, positions]
             x_block_curr = x_curr[positions].astype(np.int32)
             ip_base = ip - C_block @ x_block_curr
 
@@ -743,16 +1037,16 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                     executor.submit(
                         _evaluate_candidate_chunk,
                         C_block, ip_base, lb, ub, chunk, offset,
-                        fitness_mode, fitness_lambda)
+                        fitness_mode, fitness_lambda, modulus)
                     for chunk, offset in zip(chunks, chunk_offsets)
                 ]
                 best_idx, fitness_best, F_best = min(
                     (f.result() for f in futures), key=lambda r: r[1])
             else:
-                ip_new = (ip_base[:, np.newaxis]
-                          + C_block @ candidate_tuples.astype(np.int32).T)
+                ip_new = ip_base[:, np.newaxis] + C_block @ candidates_i32T
                 fitness_vals, F_counts = _compute_fitness_batch(
-                    ip_new, lb, ub, fitness_mode, fitness_lambda)
+                    ip_new, lb, ub, fitness_mode, fitness_lambda,
+                    modulus=modulus)
                 best_idx = int(np.argmin(fitness_vals))
                 fitness_best = float(fitness_vals[best_idx])
                 F_best = int(F_counts[best_idx])
@@ -762,11 +1056,6 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
             lateral_move = (not strict_improvement
                             and use_lateral_moves
                             and fitness_best == fitness_curr)
-
-            if lateral_move:
-                pos_key = frozenset(positions.tolist())
-                if pos_key in tabu_set:
-                    lateral_move = False
 
             accepted = strict_improvement or lateral_move
 
@@ -780,16 +1069,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                 else:
                     accepted = False
 
-            # Tier 3a: update tabu list
-            if use_lateral_moves:
-                pos_key = frozenset(positions.tolist())
-                if pos_key not in tabu_set:
-                    tabu_set.add(pos_key)
-                    tabu_queue.append(pos_key)
-                    if len(tabu_queue) > lateral_tabu_size:
-                        tabu_set.discard(tabu_queue.popleft())
-
-            # ===== Adaptive block size + stagnation tracking =====
+            # ===== Stagnation tracking + adaptive block size =====
             if strict_improvement:
                 iters_since_improvement = 0
                 if fitness_curr < fitness_best_ever:
@@ -797,30 +1077,25 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                     F_best_ever = F_curr
                     x_best_ever = x_curr.copy()
                     ip_best_ever = ip.copy()
-                # VNS: reset w to base on improvement
-                if use_adaptive_w and w_curr != w_base:
-                    w_curr = w_base
+                # On improvement: restart w=1 sweep (if enabled) or reset
+                # adaptive-w to base
+                if use_w1_sweep:
+                    _reset_w1_sweep()
+                elif use_adaptive_w and w_curr != w_adaptive_start:
+                    w_curr = w_adaptive_start
                     if verbose:
                         print(f"    [VNS] w reset to {w_curr}")
-                # Sequential-w: reset pool on improvement so low-hanging
-                # fruit at base w is re-harvested with the updated solution
-                if use_sequential_w:
-                    w_curr = w_base
-                    _init_seq_pool(w_base)
             else:
                 iters_since_improvement += 1
 
-            # Adaptive-w expansion (only when sequential-w isn't controlling
-            # the base-w phase; at higher w, adaptive-w takes over)
+            # Adaptive-w expansion (patience-based, only outside w=1 sweep)
             if (use_adaptive_w
-                    and iters_since_improvement >= adaptive_w_patience
-                    and (w_curr > w_base or not use_sequential_w)):
+                    and not in_w1_sweep
+                    and iters_since_improvement >= adaptive_w_patience):
                 new_w = min(w_curr + 1, adaptive_w_max, n)
                 if new_w != w_curr:
                     w_curr = new_w
                     iters_since_improvement = 0
-                    if use_sequential_w:
-                        _init_seq_pool(w_curr)
                     if verbose:
                         print(f"    [VNS] w expanded to {w_curr}  "
                               f"({(2*eta+1)**w_curr} candidates/step)")
@@ -839,7 +1114,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
                     extra_parts.append(f"fitness={fitness_curr:.1f}")
                 if in_sweep:
                     extra_parts.append("[sweep]")
-                if use_adaptive_w and w_curr != w_base:
+                if use_adaptive_w and w_curr != w_adaptive_start:
                     extra_parts.append(f"[w={w_curr}]")
                 extra = ("  " + ", ".join(extra_parts)) if extra_parts else ""
                 print(f"  Iter {t}: F={F_curr}, D={D_now}{tag}"
@@ -849,7 +1124,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
 
     finally:
         if executor is not None:
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=False, cancel_futures=True)
 
     # Revert to best-ever if current is worse
     if fitness_curr > fitness_best_ever:
@@ -859,8 +1134,6 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
         fitness_curr = fitness_best_ever
 
     D_final = int(np.sum(x_curr != true_key)) if true_key is not None else -1
-    if F_curr == 0:
-        iters_used = t if t <= T else T
 
     if verbose:
         extra = f", fitness={fitness_curr:.1f}" if fitness_mode != "count" else ""
@@ -879,7 +1152,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, T,
 # ===================================================================
 # MOSEK ILP fallback: exact key recovery via integer feasibility
 # ===================================================================
-def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
+def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
                        mosek_timeout=300.0, verbose=True):
     """
     Attempt exact key recovery by solving an Integer Linear Program (ILP)
@@ -903,7 +1176,7 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
     enabling effective pruning and fast convergence.
 
     Parameters:
-        C:              (R, n) int8 challenge matrix
+        C_i32:          (R, n) int32 challenge matrix
         z_tilde:        (R,) transformed relation values
         x_warm:         (n,) best key estimate from hill climbing (int8)
         params:         ML-DSA parameter dict
@@ -928,7 +1201,7 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
     n = params["n"]
     eta = params["eta"]
     beta_eff = compute_beta_eff(params, leakage_index)
-    R = C.shape[0]
+    R = C_i32.shape[0]
 
     lb = z_tilde - beta_eff
     ub = z_tilde + beta_eff
@@ -962,7 +1235,7 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
                           Domain.greaterThan(x_warm_f.tolist()))
 
             # Verification relation constraints: lb <= C @ x <= ub
-            C_mosek = Matrix.dense(C.astype(np.float64))
+            C_mosek = Matrix.dense(C_i32.astype(np.float64))
             M.constraint("verify", Expr.mul(C_mosek, x),
                           Domain.inRange(lb.tolist(), ub.tolist()))
 
@@ -1000,7 +1273,7 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
             x_sol = np.clip(x_sol, -eta, eta)
 
             # Post-solve verification
-            ip_check = C.astype(np.int32) @ x_sol.astype(np.int32)
+            ip_check = C_i32 @ x_sol.astype(np.int32)
             violated = int(np.sum((ip_check < lb) | (ip_check > ub)))
 
             if verbose:
@@ -1025,7 +1298,7 @@ def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
 # ===================================================================
 # Gurobi ILP fallback: exact key recovery via integer feasibility
 # ===================================================================
-def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
+def gurobi_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
                         gurobi_timeout=300.0, norel_time=0.0,
                         solution_limit=1, verbose=True):
     """
@@ -1051,7 +1324,7 @@ def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
     against x_true.
 
     Parameters:
-        C:              (R, n) int8 challenge matrix
+        C_i32:          (R, n) int32 challenge matrix
         z_tilde:        (R,) transformed relation values
         x_warm:         (n,) best key estimate from hill climbing (int8)
         params:         ML-DSA parameter dict
@@ -1080,7 +1353,7 @@ def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
     n = params["n"]
     eta = params["eta"]
     beta_eff = compute_beta_eff(params, leakage_index)
-    R = C.shape[0]
+    R = C_i32.shape[0]
 
     lb = z_tilde - beta_eff
     ub = z_tilde + beta_eff
@@ -1111,7 +1384,7 @@ def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
                               lb=float(-eta), ub=float(eta), name="x")
 
                 # Verification relation constraints: lb <= C @ x <= ub
-                C_f64 = C.astype(np.float64)
+                C_f64 = C_i32.astype(np.float64)
                 M.addMConstr(C_f64, x, GRB.GREATER_EQUAL, lb,
                              name="verify_lb")
                 M.addMConstr(C_f64, x, GRB.LESS_EQUAL, ub,
@@ -1176,7 +1449,7 @@ def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
                     x_sol = np.clip(x_sol, -eta, eta)
 
                     # Post-solve constraint verification
-                    ip_check = C.astype(np.int32) @ x_sol.astype(np.int32)
+                    ip_check = C_i32 @ x_sol.astype(np.int32)
                     violated = int(np.sum(
                         (ip_check < lb) | (ip_check > ub)))
 
@@ -1217,6 +1490,16 @@ def _print_summary(results, total_keys, seed=None, interrupted=False):
     """Print experiment summary from collected results."""
     n_done = len(results)
     n_success = sum(1 for r in results if r["success"])
+    # Unique: success with F=0 and exactly 1 feasible key (enumeration ran)
+    n_unique = sum(1 for r in results
+                   if r["success"] and r["F_final"] == 0
+                   and r.get("alt_keys_found", 0) == 1)
+    # Ambiguous: success but multiple feasible keys exist
+    n_ambiguous = sum(1 for r in results
+                      if r["success"] and r.get("alt_keys_found", 0) > 1)
+    n_underdetermined = sum(1 for r in results
+                           if r.get("underdetermined", False)
+                           and not r["success"])
     n_mosek_attempted = sum(1 for r in results
                            if r.get("mosek_attempted", False))
     n_mosek_success = sum(1 for r in results
@@ -1229,6 +1512,21 @@ def _print_summary(results, total_keys, seed=None, interrupted=False):
 
     print(f"\n=== Summary: {n_success}/{n_done} keys recovered "
           f"(of {total_keys} planned){status} ===")
+
+    # Breakdown of success types
+    if n_unique > 0:
+        print(f"  Unique recovery: {n_unique}")
+    if n_ambiguous > 0:
+        amb_counts = [r["alt_keys_found"] for r in results
+                      if r["success"] and r.get("alt_keys_found", 0) > 1]
+        print(f"  Ambiguous recovery: {n_ambiguous} "
+              f"(avg {np.mean(amb_counts):.1f} feasible keys)")
+    if n_underdetermined > 0:
+        undet_counts = [r["alt_keys_found"] for r in results
+                        if r.get("underdetermined", False)
+                        and not r["success"]]
+        print(f"  Underdetermined failures: {n_underdetermined} "
+              f"(avg {np.mean(undet_counts):.1f} feasible keys)")
 
     if n_mosek_attempted > 0 or n_gurobi_attempted > 0:
         n_solver_success = n_mosek_success + n_gurobi_success
@@ -1268,9 +1566,10 @@ def _print_summary(results, total_keys, seed=None, interrupted=False):
                 print(f"  Avg Gurobi pool solutions (successful): "
                       f"{np.mean(pool_counts):.1f}")
 
-    fail_results = [r for r in results if not r["success"]]
+    fail_results = [r for r in results
+                    if not r["success"] and not r.get("underdetermined", False)]
     if fail_results:
-        print(f"  Failed keys: "
+        print(f"  Failed keys (iteration limit): {len(fail_results)}, "
               f"avg D_final="
               f"{np.mean([r['D_final'] for r in fail_results]):.1f}, "
               f"avg F_final="
@@ -1292,15 +1591,18 @@ def _write_csv(results, csv_path):
 
 
 def _print_experiment_banner(args, params, beta_eff, fitness_mode,
-                             fitness_lambda, opt_flags, verbose):
+                             fitness_lambda, opt_flags, verbose,
+                             modulus=None):
     """Print the experiment configuration banner."""
     beta = params["eta"] * params["tau"]
 
-    print(f"=== Hill-Climbing Experiment v7: {params['name']} ===")
+    print(f"=== Hill-Climbing Experiment v8: {params['name']} ===")
     print(f"  Leakage index: {args.leakage}")
     if beta_eff < beta:
         print(f"  Effective error bound: beta_eff={beta_eff} "
               f"(< beta={beta}, j-independence transform skipped)")
+        if modulus is not None:
+            print(f"  Modular constraints: enabled (mod {modulus})")
     print(f"  Informative relations: {args.inf_rels}")
     print(f"  Block size w: {args.block_size}")
     print(f"  Max iterations T: {args.max_iter}")
@@ -1308,9 +1610,20 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
     print(f"  Seed: {args.seed}")
     print(f"  Verbose: {verbose}")
 
+    #TODO
+    args.mosek = False
+    args.gurobi = False
     if args.mosek:
         print(f"  MOSEK ILP fallback: enabled "
               f"(timeout={args.mosek_timeout}s)")
+
+    if args.gurobi:
+        norel_str = (f", norel={args.gurobi_norel_time}s"
+                     if args.gurobi_norel_time > 0 else "")
+        pool_str = (f", pool={args.gurobi_solution_limit}"
+                    if args.gurobi_solution_limit > 1 else "")
+        print(f"  Gurobi ILP fallback: enabled "
+              f"(timeout={args.gurobi_timeout}s{norel_str}{pool_str})")
 
     if args.gurobi:
         norel_str = (f", norel={args.gurobi_norel_time}s"
@@ -1340,7 +1653,7 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
             f"patience={args.adaptive_w_patience})")
     if opt_flags["lateral"]:
         active_opts.append(
-            f"lateral-moves (tabu={args.lateral_tabu_size})")
+            f"lateral-moves")
     if opt_flags["diversify"]:
         active_opts.append(
             f"diversify (strength={args.diversify_strength}, "
@@ -1352,9 +1665,227 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
             f"patience={args.perturb_patience}, "
             f"max={args.perturb_max}, target={target})")
     if opt_flags["sequential_w"]:
-        active_opts.append("sequential-w")
+        active_opts.append(
+            f"w1-sweep (batch={args.w1_batch_size}, "
+            f"adaptive from w={max(args.block_size, 2)})")
     print(f"  Optimizations: {', '.join(active_opts) or 'none (baseline)'}")
     print()
+
+
+# ===================================================================
+# Per-key result evaluation and solver fallbacks
+# ===================================================================
+def _evaluate_key_result(x_final, F_final, iters_used, num_perturbs,
+                         x_true, C_i32, z_tilde, beta_eff, params, args,
+                         t_hillclimb, t_datagen, t_regression,
+                         key_idx, R, total_sigs,
+                         init_correct, init_accuracy, D_init,
+                         fitness_mode, fitness_lambda, opt_flags,
+                         verbose, print_keys, modulus=None):
+    """Evaluate hill-climbing result, run solver fallbacks, return result dict.
+
+    Handles three outcome paths:
+      1. F=0: uniqueness verification via BFS enumeration
+      2. F>0: optional MOSEK and/or Gurobi ILP fallback
+      3. Result collection for all paths
+    """
+    D_final = int(np.sum(x_final != x_true))
+    success = bool(np.array_equal(x_final, x_true))
+    t_mosek = 0.0
+    mosek_attempted = False
+    mosek_success = False
+    t_gurobi = 0.0
+    gurobi_attempted = False
+    gurobi_success = False
+    gurobi_solutions_found = 0
+    alt_keys_found = 0
+    underdetermined = False
+
+    perturb_info = (f", {num_perturbs} perturbation(s)"
+                    if num_perturbs > 0 else "")
+
+    if F_final == 0:
+        # --- Uniqueness verification (attacker's perspective) ---
+        lb_enum = z_tilde - beta_eff
+        ub_enum = z_tilde + beta_eff
+        feasible_keys = enumerate_feasible_keys(
+            C_i32, x_final, lb_enum, ub_enum, params,
+            max_keys=args.max_alt_keys, verbose=verbose,
+            modulus=modulus)
+        alt_keys_found = len(feasible_keys)
+
+        # The true key check is simulation-only bookkeeping.
+        # Since x_final is always in the feasible set (it's the BFS
+        # root), if x_final == x_true then success is already True
+        # and we don't need to search.  Otherwise, scan for it.
+        if not success:
+            for x_alt in feasible_keys:
+                if np.array_equal(x_alt, x_true):
+                    success = True
+                    x_final = x_alt
+                    D_final = 0
+                    break
+
+        # Classify and report
+        if alt_keys_found == 1:
+            if success:
+                print(f"  SUCCESS (unique): key recovered in "
+                      f"{iters_used} iterations{perturb_info} "
+                      f"({t_hillclimb:.2f}s)")
+            else:
+                print(f"  *** ERROR: unique F=0 solution does not "
+                      f"match true key (D={D_final}) — possible "
+                      f"constraint system bug ***")
+        else:
+            underdetermined = True
+            cap_str = (" (cap reached)"
+                       if alt_keys_found >= args.max_alt_keys else "")
+            if success:
+                print(f"  SUCCESS (ambiguous): true key among "
+                      f"{alt_keys_found} feasible keys{cap_str} "
+                      f"({t_hillclimb:.2f}s{perturb_info})")
+            else:
+                print(f"  FAILURE (underdetermined): "
+                      f"{alt_keys_found} feasible keys found"
+                      f"{cap_str}, true key not among them "
+                      f"(D={D_final})")
+
+    elif F_final > 0:
+        print(f"  FAILURE: T={args.max_iter} reached, F={F_final}, "
+              f"D={D_final}{perturb_info} ({t_hillclimb:.2f}s)")
+
+        # MOSEK ILP fallback
+        if args.mosek and not _interrupt_event.is_set():
+            mosek_attempted = True
+            print(f"  Attempting MOSEK ILP recovery from "
+                  f"hill-climbing warm start (D={D_final})...")
+            x_mosek, t_mosek = mosek_ilp_recovery(
+                C_i32, z_tilde, x_final, params, args.leakage,
+                mosek_timeout=args.mosek_timeout, verbose=verbose)
+
+            if x_mosek is not None:
+                D_mosek = int(np.sum(x_mosek != x_true))
+                mosek_success = bool(
+                    np.array_equal(x_mosek, x_true))
+                if mosek_success:
+                    x_final = x_mosek
+                    D_final = 0
+                    F_final = 0
+                    success = True
+                    print(f"  SUCCESS (MOSEK): key recovered "
+                          f"({t_hillclimb:.2f}s climb + "
+                          f"{t_mosek:.2f}s ILP)")
+                else:
+                    print(f"  MOSEK returned a solution but "
+                          f"D={D_mosek} (not the true key)")
+                    if D_mosek < D_final:
+                        print(f"  MOSEK improved D: "
+                              f"{D_final} -> {D_mosek}")
+                        x_final = x_mosek
+                        D_final = D_mosek
+            else:
+                print(f"  MOSEK ILP did not find a solution "
+                      f"({t_mosek:.2f}s)")
+
+        # Gurobi ILP fallback (runs if still not successful)
+        if (args.gurobi and not success
+                and not _interrupt_event.is_set()):
+            gurobi_attempted = True
+            sol_str = (f", pool={args.gurobi_solution_limit}"
+                       if args.gurobi_solution_limit > 1 else "")
+            print(f"  Attempting Gurobi feasibility ILP from "
+                  f"hill-climbing warm start "
+                  f"(D={D_final}{sol_str})...")
+            grb_solutions, t_gurobi = gurobi_ilp_recovery(
+                C_i32, z_tilde, x_final, params, args.leakage,
+                gurobi_timeout=args.gurobi_timeout,
+                norel_time=args.gurobi_norel_time,
+                solution_limit=args.gurobi_solution_limit,
+                verbose=verbose)
+
+            gurobi_solutions_found = len(grb_solutions)
+
+            if grb_solutions:
+                for s_idx, x_grb in enumerate(grb_solutions):
+                    D_grb = int(np.sum(x_grb != x_true))
+                    if np.array_equal(x_grb, x_true):
+                        gurobi_success = True
+                        x_final = x_grb
+                        D_final = 0
+                        F_final = 0
+                        success = True
+                        if gurobi_solutions_found > 1:
+                            print(
+                                f"  SUCCESS (Gurobi): key is pool "
+                                f"solution {s_idx} of "
+                                f"{gurobi_solutions_found} "
+                                f"({t_hillclimb:.2f}s climb + "
+                                f"{t_gurobi:.2f}s ILP)")
+                        else:
+                            print(
+                                f"  SUCCESS (Gurobi): key recovered "
+                                f"({t_hillclimb:.2f}s climb + "
+                                f"{t_gurobi:.2f}s ILP)")
+                        break
+                    elif verbose:
+                        print(
+                            f"  Gurobi pool solution {s_idx}: "
+                            f"D={D_grb}")
+
+                if not gurobi_success:
+                    distances = [int(np.sum(x_g != x_true))
+                                 for x_g in grb_solutions]
+                    best_idx = int(np.argmin(distances))
+                    D_grb_best = distances[best_idx]
+                    print(
+                        f"  Gurobi found {gurobi_solutions_found} "
+                        f"solution(s), none is the true key "
+                        f"(best D={D_grb_best})")
+                    if D_grb_best < D_final:
+                        print(f"  Gurobi improved D: "
+                              f"{D_final} -> {D_grb_best}")
+                        x_final = grb_solutions[best_idx]
+                        D_final = D_grb_best
+            else:
+                print(f"  Gurobi ILP did not find a solution "
+                      f"({t_gurobi:.2f}s)")
+
+    if verbose and print_keys:
+        print(f"  True key: {format_key(x_true)}")
+
+    return dict(
+        key_idx=key_idx,
+        variant=params["name"],
+        leakage_index=args.leakage,
+        r_informative=R,
+        total_signatures=total_sigs,
+        block_size=args.block_size,
+        max_iter=args.max_iter,
+        fitness_mode=fitness_mode,
+        fitness_lambda=(fitness_lambda
+                        if fitness_mode == "combined" else None),
+        init_correct=init_correct,
+        init_accuracy=init_accuracy,
+        D_init=D_init,
+        F_final=F_final,
+        D_final=D_final,
+        iterations=iters_used,
+        num_perturbations=num_perturbs,
+        success=success,
+        alt_keys_found=alt_keys_found,
+        underdetermined=underdetermined,
+        t_datagen=t_datagen,
+        t_regression=t_regression,
+        t_hillclimb=t_hillclimb,
+        t_mosek=t_mosek,
+        mosek_attempted=mosek_attempted,
+        mosek_success=mosek_success,
+        t_gurobi=t_gurobi,
+        gurobi_attempted=gurobi_attempted,
+        gurobi_success=gurobi_success,
+        gurobi_solutions_found=gurobi_solutions_found,
+        **{f"opt_{k}": v for k, v in opt_flags.items()},
+    )
 
 
 # ===================================================================
@@ -1376,23 +1907,31 @@ def run_experiment(args):
 
     # Resolve fitness mode
     fitness_mode = args.fitness
+    beta_eff = compute_beta_eff(params, args.leakage)
     fitness_lambda = (args.fitness_lambda if args.fitness_lambda is not None
-                      else float(eta * params["tau"]))
+                      else float(beta_eff))
 
-    # Resolve --all-optimizations into individual flags
+    # Modular constraint checking: when beta_eff < beta, the LWE relations
+    # are modular (mod 2^{ell+1}) and wrapping can occur for large inner
+    # products.  The fitness functions must use centered modular residuals.
+    beta = params["eta"] * params["tau"]
+    modulus = (int(2 ** (args.leakage + 1)) if beta_eff < beta else None)
+
+    # Resolve --all-optimizations / --default-optimizations into individual flags
+    all_opt = args.all_optimizations
+    dflt_opt = args.default_optimizations
     opt_flags = dict(
-        score_guided=args.score_guided or args.all_optimizations,
-        adaptive_w=args.adaptive_w or args.all_optimizations,
-        lateral=args.lateral_moves or args.all_optimizations,
-        diversify=args.diversify or args.all_optimizations,
-        perturb=args.perturb_restart or args.all_optimizations,
-        sequential_w=args.sequential_w or args.all_optimizations,
+        score_guided=args.score_guided or all_opt,
+        adaptive_w=args.adaptive_w or all_opt or dflt_opt,
+        lateral=args.lateral_moves or all_opt or dflt_opt,
+        diversify=args.diversify or all_opt or dflt_opt,
+        perturb=args.perturb_restart or all_opt or dflt_opt,
+        sequential_w=args.sequential_w or all_opt or dflt_opt,
     )
 
-    beta_eff = compute_beta_eff(params, args.leakage)
-
     _print_experiment_banner(args, params, beta_eff, fitness_mode,
-                             fitness_lambda, opt_flags, verbose)
+                             fitness_lambda, opt_flags, verbose,
+                             modulus=modulus)
 
     csv_path = Path(args.output) if args.output else None
     if csv_path:
@@ -1417,6 +1956,7 @@ def run_experiment(args):
                 rng, x_true, args.inf_rels, params, args.leakage)
             t_datagen = perf_counter() - t0
             R = len(z_tilde)
+            C_i32 = C.astype(np.int32)         # single cast for all consumers
             print(f"  Phase 1: {R} inf. rels from {total_sigs} signatures "
                   f"({t_datagen:.1f}s)")
 
@@ -1459,18 +1999,18 @@ def run_experiment(args):
             # --- Phase 2: Hill-climbing ---
             t0 = perf_counter()
             x_final, F_final, iters_used, history, num_perturbs = hillclimb(
-                C, z_tilde, x_init, params, rng,
+                C_i32, z_tilde, x_init, params, rng,
                 w=args.block_size, T=args.max_iter,
                 leakage_index=args.leakage,
                 true_key=x_true, verbose=verbose, print_keys=print_keys,
                 num_workers=args.workers,
                 fitness_mode=fitness_mode, fitness_lambda=fitness_lambda,
+                modulus=modulus,
                 score_weights=score_weights,
                 use_adaptive_w=opt_flags["adaptive_w"],
                 adaptive_w_max=args.adaptive_w_max,
                 adaptive_w_patience=args.adaptive_w_patience,
                 use_lateral_moves=opt_flags["lateral"],
-                lateral_tabu_size=args.lateral_tabu_size,
                 use_diversify=opt_flags["diversify"],
                 diversify_strength=args.diversify_strength,
                 sweep_interval=args.sweep_interval,
@@ -1479,168 +2019,19 @@ def run_experiment(args):
                 perturb_patience=args.perturb_patience,
                 perturb_max=args.perturb_max,
                 perturb_score_guided=args.perturb_score_guided,
-                use_sequential_w=opt_flags["sequential_w"])
+                use_w1_sweep=opt_flags["sequential_w"],
+                w1_batch_size=args.w1_batch_size)
             t_hillclimb = perf_counter() - t0
 
-            # --- Result evaluation (+ optional MOSEK / Gurobi fallback) ---
-            success = bool(np.array_equal(x_final, x_true))
-            D_final = int(np.sum(x_final != x_true))
-            t_mosek = 0.0
-            mosek_attempted = False
-            mosek_success = False
-            t_gurobi = 0.0
-            gurobi_attempted = False
-            gurobi_success = False
-            gurobi_solutions_found = 0
-
-            if F_final == 0 and not success:
-                print(f"  *** FALSE POSITIVE: F=0 but D={D_final} ***")
-
-            elif success:
-                perturb_info = (f", {num_perturbs} perturbation(s)"
-                                if num_perturbs > 0 else "")
-                print(f"  SUCCESS: key recovered in {iters_used} iterations"
-                      f"{perturb_info} ({t_hillclimb:.2f}s)")
-
-            else:
-                perturb_info = (f", {num_perturbs} perturbation(s)"
-                                if num_perturbs > 0 else "")
-                print(f"  FAILURE: T={args.max_iter} reached, F={F_final}, "
-                      f"D={D_final}{perturb_info} ({t_hillclimb:.2f}s)")
-
-                # MOSEK ILP fallback
-                if args.mosek and not _interrupt_event.is_set():
-                    mosek_attempted = True
-                    print(f"  Attempting MOSEK ILP recovery from "
-                          f"hill-climbing warm start (D={D_final})...")
-                    x_mosek, t_mosek = mosek_ilp_recovery(
-                        C, z_tilde, x_final, params, args.leakage,
-                        mosek_timeout=args.mosek_timeout, verbose=verbose)
-
-                    if x_mosek is not None:
-                        D_mosek = int(np.sum(x_mosek != x_true))
-                        mosek_success = bool(
-                            np.array_equal(x_mosek, x_true))
-                        if mosek_success:
-                            x_final = x_mosek
-                            D_final = 0
-                            F_final = 0
-                            success = True
-                            print(f"  SUCCESS (MOSEK): key recovered "
-                                  f"({t_hillclimb:.2f}s climb + "
-                                  f"{t_mosek:.2f}s ILP)")
-                        else:
-                            print(f"  MOSEK returned a solution but "
-                                  f"D={D_mosek} (not the true key)")
-                            if D_mosek < D_final:
-                                print(f"  MOSEK improved D: "
-                                      f"{D_final} -> {D_mosek}")
-                                x_final = x_mosek
-                                D_final = D_mosek
-                    else:
-                        print(f"  MOSEK ILP did not find a solution "
-                              f"({t_mosek:.2f}s)")
-
-                # Gurobi ILP fallback (runs if still not successful)
-                if (args.gurobi and not success
-                        and not _interrupt_event.is_set()):
-                    gurobi_attempted = True
-                    sol_str = (f", pool={args.gurobi_solution_limit}"
-                               if args.gurobi_solution_limit > 1 else "")
-                    print(f"  Attempting Gurobi feasibility ILP from "
-                          f"hill-climbing warm start "
-                          f"(D={D_final}{sol_str})...")
-                    grb_solutions, t_gurobi = gurobi_ilp_recovery(
-                        C, z_tilde, x_final, params, args.leakage,
-                        gurobi_timeout=args.gurobi_timeout,
-                        norel_time=args.gurobi_norel_time,
-                        solution_limit=args.gurobi_solution_limit,
-                        verbose=verbose)
-
-                    gurobi_solutions_found = len(grb_solutions)
-
-                    if grb_solutions:
-                        # Check each pool solution against true key
-                        for s_idx, x_grb in enumerate(grb_solutions):
-                            D_grb = int(np.sum(x_grb != x_true))
-                            if np.array_equal(x_grb, x_true):
-                                gurobi_success = True
-                                x_final = x_grb
-                                D_final = 0
-                                F_final = 0
-                                success = True
-                                if gurobi_solutions_found > 1:
-                                    print(
-                                        f"  SUCCESS (Gurobi): key is pool "
-                                        f"solution {s_idx} of "
-                                        f"{gurobi_solutions_found} "
-                                        f"({t_hillclimb:.2f}s climb + "
-                                        f"{t_gurobi:.2f}s ILP)")
-                                else:
-                                    print(
-                                        f"  SUCCESS (Gurobi): key recovered "
-                                        f"({t_hillclimb:.2f}s climb + "
-                                        f"{t_gurobi:.2f}s ILP)")
-                                break
-                            elif verbose:
-                                print(
-                                    f"  Gurobi pool solution {s_idx}: "
-                                    f"D={D_grb}")
-
-                        if not gurobi_success:
-                            # Pick the closest solution as best estimate
-                            distances = [int(np.sum(x_g != x_true))
-                                         for x_g in grb_solutions]
-                            best_idx = int(np.argmin(distances))
-                            D_grb_best = distances[best_idx]
-                            print(
-                                f"  Gurobi found {gurobi_solutions_found} "
-                                f"solution(s), none is the true key "
-                                f"(best D={D_grb_best})")
-                            if D_grb_best < D_final:
-                                print(f"  Gurobi improved D: "
-                                      f"{D_final} -> {D_grb_best}")
-                                x_final = grb_solutions[best_idx]
-                                D_final = D_grb_best
-                    else:
-                        print(f"  Gurobi ILP did not find a solution "
-                              f"({t_gurobi:.2f}s)")
-
-            if verbose and print_keys:
-                print(f"  True key: {format_key(x_true)}")
-
-            # --- Collect result ---
-            result = dict(
-                key_idx=key_idx,
-                variant=params["name"],
-                leakage_index=args.leakage,
-                r_informative=R,
-                total_signatures=total_sigs,
-                block_size=args.block_size,
-                max_iter=args.max_iter,
-                fitness_mode=fitness_mode,
-                fitness_lambda=(fitness_lambda
-                                if fitness_mode == "combined" else None),
-                init_correct=init_correct,
-                init_accuracy=init_accuracy,
-                D_init=D_init,
-                F_final=F_final,
-                D_final=D_final,
-                iterations=iters_used,
-                num_perturbations=num_perturbs,
-                success=success,
-                t_datagen=t_datagen,
-                t_regression=t_regression,
-                t_hillclimb=t_hillclimb,
-                t_mosek=t_mosek,
-                mosek_attempted=mosek_attempted,
-                mosek_success=mosek_success,
-                t_gurobi=t_gurobi,
-                gurobi_attempted=gurobi_attempted,
-                gurobi_success=gurobi_success,
-                gurobi_solutions_found=gurobi_solutions_found,
-                **{f"opt_{k}": v for k, v in opt_flags.items()},
-            )
+            # --- Result evaluation, solver fallbacks, result collection ---
+            result = _evaluate_key_result(
+                x_final, F_final, iters_used, num_perturbs,
+                x_true, C_i32, z_tilde, beta_eff, params, args,
+                t_hillclimb, t_datagen, t_regression,
+                key_idx, R, total_sigs,
+                init_correct, init_accuracy, D_init,
+                fitness_mode, fitness_lambda, opt_flags,
+                verbose, print_keys, modulus=modulus)
             results.append(result)
             print()
 
@@ -1664,7 +2055,7 @@ def run_experiment(args):
 # ===================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Hill-climbing ML-DSA key recovery experiment (v7)",
+        description="Hill-climbing ML-DSA key recovery experiment (v8)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Fitness modes (--fitness):
@@ -1678,26 +2069,27 @@ Optimization strategies:
   --lateral-moves     Tier 3a: Accept ties to drift along plateaus
   --diversify         Tier 3b: Penalise frequently selected positions
   --perturb-restart   Tier 4: ILS -- perturb & restart to escape plateaus
-  --sequential-w      Tier 5: Exhaust positions at base w before expanding
+  --sequential-w      Tier 5: w=1 sweep preamble before adaptive search
   --all-optimizations Enable all of the above
+  --default-optimizations  Enable all except score-guided (recommended)
 
-MOSEK ILP fallback:
+MOSEK ILP fallback (currently disabled):
   --mosek             On failure, attempt exact recovery via MOSEK ILP
   --mosek-timeout N   Solver time limit in seconds (default: 300)
 
-Gurobi ILP fallback:
+Gurobi ILP fallback (currently disabled):
   --gurobi                   On failure, attempt recovery via Gurobi ILP
   --gurobi-timeout N         Solver time limit in seconds (default: 300)
   --gurobi-norel-time N      No-relaxation heuristic budget (default: 0)
   --gurobi-solution-limit K  Find up to K solutions (default: 1)
 
 Examples:
-  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 5
-  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 5 \\
+  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 2
+  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 2 \\
       --all-optimizations --mosek --mosek-timeout 120
-  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 5 \\
+  python hillclimb_mldsa.py --params 44 --inf-rels 25000 --block-size 2 \\
       --all-optimizations --gurobi --gurobi-timeout 120 --gurobi-norel-time 30
-  python hillclimb_mldsa.py --params 44 --inf-rels 15000 --block-size 5 \\
+  python hillclimb_mldsa.py --params 44 --inf-rels 15000 --block-size 2 \\
       --gurobi --gurobi-solution-limit 10
         """,
     )
@@ -1712,8 +2104,9 @@ Examples:
                       help="Number of random keys to test")
     core.add_argument("--inf-rels", type=int, required=True,
                       help="Number of informative relations to collect (r)")
-    core.add_argument("--block-size", type=int, default=5,
-                      help="Base block size w (positions per step)")
+    core.add_argument("--block-size", type=int, default=2,
+                      help="Base block size w for adaptive search "
+                           "(default: 2)")
     core.add_argument("--max-iter", type=int, default=1000000,
                       help="Maximum hill-climbing iterations T")
     core.add_argument("--output", type=str, default=None,
@@ -1741,20 +2134,21 @@ Examples:
     opt = parser.add_argument_group("Optimization strategies")
     opt.add_argument("--all-optimizations", action="store_true",
                      help="Enable all optimization strategies")
+    opt.add_argument("--default-optimizations", action="store_true",
+                     help="Enable all optimizations except score-guided "
+                          "sampling (recommended starting point)")
     opt.add_argument("--score-guided", action="store_true",
                      help="Tier 1: Score-guided position sampling")
     opt.add_argument("--score-temperature", type=float, default=2.0,
                      help="Temperature for score-guided softmax (default: 2.0)")
     opt.add_argument("--adaptive-w", action="store_true",
                      help="Tier 2: VNS-style adaptive block size")
-    opt.add_argument("--adaptive-w-max", type=int, default=6,
-                     help="Maximum block size during expansion (default: 6)")
+    opt.add_argument("--adaptive-w-max", type=int, default=4,
+                     help="Maximum block size during expansion (default: 4)")
     opt.add_argument("--adaptive-w-patience", type=int, default=50,
                      help="Iters without improvement before expanding w")
     opt.add_argument("--lateral-moves", action="store_true",
-                     help="Tier 3a: Accept ties with tabu")
-    opt.add_argument("--lateral-tabu-size", type=int, default=20,
-                     help="Tabu list size (default: 20)")
+                     help="Tier 3a: Accept ties to drift along plateaus")
     opt.add_argument("--diversify", action="store_true",
                      help="Tier 3b: Frequency-based diversification")
     opt.add_argument("--diversify-strength", type=float, default=1.0,
@@ -1767,43 +2161,48 @@ Examples:
                      help="Positions to reassign per perturbation")
     opt.add_argument("--perturb-patience", type=int, default=50,
                      help="Iters stuck before perturbing")
-    opt.add_argument("--perturb-max", type=int, default=50,
+    opt.add_argument("--perturb-max", type=int, default=150,
                      help="Maximum perturbations per key")
     opt.add_argument("--perturb-score-guided", action="store_true",
                      help="Bias perturbation targets toward uncertain "
                           "positions")
     opt.add_argument("--sequential-w", action="store_true",
-                     help="Tier 5: Exhaust all position subsets at base w "
-                          "before expanding.  Systematically harvests "
-                          "low-hanging fruit at low w.")
+                     help="Tier 5: w=1 sweep preamble before adaptive search. "
+                          "Exhaustively tests every position individually, "
+                          "then transitions to adaptive block size.")
+    opt.add_argument("--w1-batch-size", type=int, default=16,
+                     help="Positions per thread during w=1 sweep (default: 16)")
+    opt.add_argument("--max-alt-keys", type=int, default=100,
+                     help="When F=0, enumerate up to this many feasible "
+                          "keys via distance-1 BFS (default: 100)")
 
-    # MOSEK ILP fallback
-    mosek_grp = parser.add_argument_group("MOSEK ILP fallback")
-    mosek_grp.add_argument(
-        "--mosek", action="store_true",
-        help="On failure, attempt exact recovery via MOSEK ILP")
-    mosek_grp.add_argument(
-        "--mosek-timeout", type=float, default=300.0,
-        help="MOSEK solver time limit in seconds (default: 300)")
+    ## MOSEK ILP fallback
+    #mosek_grp = parser.add_argument_group("MOSEK ILP fallback")
+    #mosek_grp.add_argument(
+    #    "--mosek", action="store_true",
+    #    help="On failure, attempt exact recovery via MOSEK ILP")
+    #mosek_grp.add_argument(
+    #    "--mosek-timeout", type=float, default=300.0,
+    #    help="MOSEK solver time limit in seconds (default: 300)")
 
-    # Gurobi ILP fallback
-    gurobi_grp = parser.add_argument_group("Gurobi ILP fallback")
-    gurobi_grp.add_argument(
-        "--gurobi", action="store_true",
-        help="On failure, attempt recovery via Gurobi feasibility ILP")
-    gurobi_grp.add_argument(
-        "--gurobi-timeout", type=float, default=300.0,
-        help="Gurobi solver time limit in seconds (default: 300)")
-    gurobi_grp.add_argument(
-        "--gurobi-norel-time", type=float, default=0.0,
-        help="No-relaxation heuristic time budget in seconds (default: 0 = "
-             "Gurobi default). Runs a feasibility heuristic before B&B; "
-             "terminates immediately on finding a feasible point.")
-    gurobi_grp.add_argument(
-        "--gurobi-solution-limit", type=int, default=1,
-        help="Number of feasible solutions to find (default: 1). "
-             "When >1, activates Gurobi's solution pool to enumerate "
-             "multiple distinct keys.")
+    ## Gurobi ILP fallback
+    #gurobi_grp = parser.add_argument_group("Gurobi ILP fallback")
+    #gurobi_grp.add_argument(
+    #    "--gurobi", action="store_true",
+    #    help="On failure, attempt recovery via Gurobi feasibility ILP")
+    #gurobi_grp.add_argument(
+    #    "--gurobi-timeout", type=float, default=300.0,
+    #    help="Gurobi solver time limit in seconds (default: 300)")
+    #gurobi_grp.add_argument(
+    #    "--gurobi-norel-time", type=float, default=0.0,
+    #    help="No-relaxation heuristic time budget in seconds (default: 0 = "
+    #         "Gurobi default). Runs a feasibility heuristic before B&B; "
+    #         "terminates immediately on finding a feasible point.")
+    #gurobi_grp.add_argument(
+    #    "--gurobi-solution-limit", type=int, default=1,
+    #    help="Number of feasible solutions to find (default: 1). "
+    #         "When >1, activates Gurobi's solution pool to enumerate "
+    #         "multiple distinct keys.")
 
     args = parser.parse_args()
     run_experiment(args)
