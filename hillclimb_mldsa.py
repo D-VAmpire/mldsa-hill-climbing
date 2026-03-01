@@ -8,7 +8,7 @@ relation extraction and the j-independence transformation to produce Integer
 LWE relations; Phase 2 uses OLS regression for a warm start, then iteratively
 minimises a fitness function over the coefficient space.
 
-Optional MOSEK ILP fallback (--mosek):
+Optional MOSEK ILP fallback (--mosek) (currently disabled):
   When hill climbing exhausts --max-iter without recovering the key, the best
   intermediate solution x' is handed to MOSEK's mixed-integer optimizer as a
   warm start for an Integer Linear Program.  The ILP encodes *all* verification
@@ -22,7 +22,7 @@ Optional MOSEK ILP fallback (--mosek):
 
   Requires the MOSEK Python package (``pip install Mosek``) and a valid license.
 
-Optional Gurobi ILP fallback (--gurobi):
+Optional Gurobi ILP fallback (--gurobi) (currently disabled):
   Alternative ILP fallback using Gurobi as a pure feasibility solver (no
   objective function).  The hill-climbing estimate x' is injected via Gurobi's
   VarHintVal mechanism, which guides both heuristics and branching decisions
@@ -1610,6 +1610,9 @@ def _print_experiment_banner(args, params, beta_eff, fitness_mode,
     print(f"  Seed: {args.seed}")
     print(f"  Verbose: {verbose}")
 
+    #TODO
+    args.mosek = False
+    args.gurobi = False
     if args.mosek:
         print(f"  MOSEK ILP fallback: enabled "
               f"(timeout={args.mosek_timeout}s)")
@@ -2070,11 +2073,11 @@ Optimization strategies:
   --all-optimizations Enable all of the above
   --default-optimizations  Enable all except score-guided (recommended)
 
-MOSEK ILP fallback:
+MOSEK ILP fallback (currently disabled):
   --mosek             On failure, attempt exact recovery via MOSEK ILP
   --mosek-timeout N   Solver time limit in seconds (default: 300)
 
-Gurobi ILP fallback:
+Gurobi ILP fallback (currently disabled):
   --gurobi                   On failure, attempt recovery via Gurobi ILP
   --gurobi-timeout N         Solver time limit in seconds (default: 300)
   --gurobi-norel-time N      No-relaxation heuristic budget (default: 0)
@@ -2173,33 +2176,33 @@ Examples:
                      help="When F=0, enumerate up to this many feasible "
                           "keys via distance-1 BFS (default: 100)")
 
-    # MOSEK ILP fallback
-    mosek_grp = parser.add_argument_group("MOSEK ILP fallback")
-    mosek_grp.add_argument(
-        "--mosek", action="store_true",
-        help="On failure, attempt exact recovery via MOSEK ILP")
-    mosek_grp.add_argument(
-        "--mosek-timeout", type=float, default=300.0,
-        help="MOSEK solver time limit in seconds (default: 300)")
+    ## MOSEK ILP fallback
+    #mosek_grp = parser.add_argument_group("MOSEK ILP fallback")
+    #mosek_grp.add_argument(
+    #    "--mosek", action="store_true",
+    #    help="On failure, attempt exact recovery via MOSEK ILP")
+    #mosek_grp.add_argument(
+    #    "--mosek-timeout", type=float, default=300.0,
+    #    help="MOSEK solver time limit in seconds (default: 300)")
 
-    # Gurobi ILP fallback
-    gurobi_grp = parser.add_argument_group("Gurobi ILP fallback")
-    gurobi_grp.add_argument(
-        "--gurobi", action="store_true",
-        help="On failure, attempt recovery via Gurobi feasibility ILP")
-    gurobi_grp.add_argument(
-        "--gurobi-timeout", type=float, default=300.0,
-        help="Gurobi solver time limit in seconds (default: 300)")
-    gurobi_grp.add_argument(
-        "--gurobi-norel-time", type=float, default=0.0,
-        help="No-relaxation heuristic time budget in seconds (default: 0 = "
-             "Gurobi default). Runs a feasibility heuristic before B&B; "
-             "terminates immediately on finding a feasible point.")
-    gurobi_grp.add_argument(
-        "--gurobi-solution-limit", type=int, default=1,
-        help="Number of feasible solutions to find (default: 1). "
-             "When >1, activates Gurobi's solution pool to enumerate "
-             "multiple distinct keys.")
+    ## Gurobi ILP fallback
+    #gurobi_grp = parser.add_argument_group("Gurobi ILP fallback")
+    #gurobi_grp.add_argument(
+    #    "--gurobi", action="store_true",
+    #    help="On failure, attempt recovery via Gurobi feasibility ILP")
+    #gurobi_grp.add_argument(
+    #    "--gurobi-timeout", type=float, default=300.0,
+    #    help="Gurobi solver time limit in seconds (default: 300)")
+    #gurobi_grp.add_argument(
+    #    "--gurobi-norel-time", type=float, default=0.0,
+    #    help="No-relaxation heuristic time budget in seconds (default: 0 = "
+    #         "Gurobi default). Runs a feasibility heuristic before B&B; "
+    #         "terminates immediately on finding a feasible point.")
+    #gurobi_grp.add_argument(
+    #    "--gurobi-solution-limit", type=int, default=1,
+    #    help="Number of feasible solutions to find (default: 1). "
+    #         "When >1, activates Gurobi's solution pool to enumerate "
+    #         "multiple distinct keys.")
 
     args = parser.parse_args()
     run_experiment(args)
