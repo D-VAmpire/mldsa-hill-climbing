@@ -400,6 +400,56 @@ def generate_informative_relations(rng, x_true, r_target, params,
     return z_tilde, C, total_signatures
 
 
+def generate_informative_relations_parallel(rng, x_true, r_target, params,
+                                            leakage_index, noise_level,
+                                            num_workers):
+    """
+    Parallel wrapper for Phase 1 data generation.
+
+    Splits the target relation count evenly across *num_workers* threads,
+    each operating on an independent RNG (spawned via SeedSequence).  NumPy
+    batch operations release the GIL, so ThreadPoolExecutor gives real
+    parallelism without the serialisation overhead of multiprocessing.
+
+    Parameters:
+        (same as generate_informative_relations, plus)
+        num_workers: number of threads to use
+
+    Returns:
+        z_tilde, C, total_signatures  (same semantics as the serial version)
+    """
+    if num_workers <= 1:
+        return generate_informative_relations(
+            rng, x_true, r_target, params, leakage_index, noise_level)
+
+    # Split target across workers (last worker absorbs remainder)
+    base, remainder = divmod(r_target, num_workers)
+    chunk_sizes = [base + (1 if i < remainder else 0)
+                   for i in range(num_workers)]
+
+    # Spawn independent RNGs from the parent (reproducible & non-overlapping)
+    child_rngs = rng.spawn(num_workers)
+
+    def _worker(worker_rng, chunk_target):
+        return generate_informative_relations(
+            worker_rng, x_true, chunk_target, params,
+            leakage_index, noise_level)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(_worker, child_rngs[i], chunk_sizes[i])
+            for i in range(num_workers)
+        ]
+        worker_results = [f.result() for f in futures]
+
+    # Concatenate results
+    z_tilde = np.concatenate([wr[0] for wr in worker_results])
+    C = np.vstack([wr[1] for wr in worker_results])
+    total_signatures = sum(wr[2] for wr in worker_results)
+
+    return z_tilde, C, total_signatures
+
+
 # ===================================================================
 # Phase 1b: Regression warm start with noise rescaling
 # ===================================================================
@@ -1750,9 +1800,9 @@ def run_experiment(args):
                 print(f"  True key: {format_key(x_true)}")
 
             t0 = perf_counter()
-            z_tilde, C, total_sigs = generate_informative_relations(
+            z_tilde, C, total_sigs = generate_informative_relations_parallel(
                 rng, x_true, args.inf_rels, params, args.leakage,
-                args.noise_level)
+                args.noise_level, num_workers=args.workers)
             t_datagen = perf_counter() - t0
             R = len(z_tilde)
             C_i32 = C.astype(np.int32)         # single cast for all consumers
@@ -1925,7 +1975,8 @@ Examples:
     core.add_argument("--print-keys", action="store_true",
                       help="Print intermediate key vectors (very verbose)")
     core.add_argument("--workers", type=int, default=1,
-                      help="Threads for parallel candidate evaluation")
+                      help="Threads for parallel Phase 1 data generation "
+                           "and Phase 2 candidate evaluation")
 
     # Optimization flags
     opt = parser.add_argument_group("Optimization strategies")
