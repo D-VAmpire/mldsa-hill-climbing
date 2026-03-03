@@ -24,7 +24,7 @@ run_sweep() {
 }
 
 # ML-DSA-44
-run_sweep 44 6 7000
+run_sweep 44 6 6000
 run_sweep 44 7 11500
 run_sweep 44 8 14500
 run_sweep 44 9 14500
