@@ -161,6 +161,23 @@ MLDSA_PARAMS = {
     87: dict(n=256, eta=2, gamma=2**19, tau=60, name="ML-DSA-87"),
 }
 
+# Peak-memory budget for candidate evaluation (see _find_best_candidate).
+# The inner loop materialises an (R x K) matrix where R = number of
+# relations and K = number of candidate tuples = (2*eta+1)^w.  For
+# ML-DSA-65 (eta=4) at block size w=4 this gives K = 9^4 = 6561;
+# combined with large R (millions of relations) the resulting
+# intermediate arrays can easily exceed available RAM.  Evaluation is
+# therefore chunked so that no single intermediate exceeds this budget.
+_CANDIDATE_EVAL_MEMORY_BUDGET = 512 * 1024 * 1024   # 512 MiB
+
+# Maximum number of samples per batch in Phase 1 data generation.
+# Without a cap the first batch attempts to allocate arrays for
+# 5 * r_target samples at once, which for large r_target and n=256
+# can require tens of gigabytes (the dominant array is the (n_batch, n)
+# float64 random matrix used for challenge-position sampling).
+# The while-loop simply runs more iterations to reach r_target.
+_MAX_PHASE1_BATCH = 2_000_000
+
 
 def compute_beta_eff(params, leakage_index):
     """Effective error bound: min(beta, 2^{ell-1}).
@@ -281,11 +298,11 @@ def generate_informative_relations(rng, x_true, r_target, params,
     z_collected = []
     C_collected = []
     total_signatures = 0
-    batch_size = max(r_target, 1000)
+    batch_size = max(min(r_target, _MAX_PHASE1_BATCH), 1000)
 
     while n_collected < r_target:
         remaining = r_target - n_collected
-        n_batch = max(remaining * 5, batch_size)
+        n_batch = min(max(remaining * 5, batch_size), _MAX_PHASE1_BATCH)
 
         # --- Batch sample generation ---
         y_batch = rng.integers(-(gamma - 1), gamma, size=n_batch,
@@ -598,20 +615,130 @@ def _compute_fitness_batch(ip_batch, lb, ub, z_tilde_int=None, beta_eff=None,
 # ===================================================================
 # Phase 2: Hill-climbing with optional optimizations
 # ===================================================================
+def _matvec_int8(C, x, _block=200_000):
+    """Compute C @ x where C is int8 without allocating a full int32 copy.
+
+    The challenge matrix C is stored in int8 to save memory (entries are
+    in {-1, 0, +1}).  A naive ``C.astype(np.int32) @ x.astype(np.int32)``
+    would temporarily allocate an (R, n) int32 array -- for R = 5 x 10^6
+    this is > 5 GiB.  This helper performs the product in row-blocks so
+    that the int32 temporary never exceeds ~200 MB.
+
+    Parameters:
+        C: (R, n) int8 challenge matrix
+        x: (n,) int8 key vector
+
+    Returns:
+        ip: (R,) int32 inner-product vector
+    """
+    R = C.shape[0]
+    x32 = x.astype(np.int32)
+    ip = np.empty(R, dtype=np.int32)
+    for i in range(0, R, _block):
+        j = min(i + _block, R)
+        ip[i:j] = C[i:j].astype(np.int32) @ x32
+    return ip
+
+
+def _find_best_candidate(C_block, ip_base, candidates_i32T, lb, ub,
+                         z_tilde_int=None, beta_eff=None, modulus=None,
+                         offset=0):
+    """Find the candidate assignment that minimises the violation count.
+
+    Evaluates all candidates encoded in *candidates_i32T* against the
+    constraint system, returning the index, fitness, and violation count
+    of the best one.
+
+    Memory-bounded evaluation:  The naive approach materialises an
+    ``(R, K)`` matrix (``R`` relations, ``K`` candidates) whose
+    intermediate arrays (int32 inner products, int64 residuals and
+    temporaries, bool violation mask) peak at roughly 30 bytes per
+    element.  For high-eta parameter sets at elevated block sizes this
+    can far exceed available RAM -- e.g. ML-DSA-65 (eta=4) at w=4
+    gives K = 9^4 = 6561; with R = 2 x 10^6 relations the
+    intermediates alone would require > 350 GiB.
+
+    When the estimated peak exceeds ``_CANDIDATE_EVAL_MEMORY_BUDGET``
+    the evaluation is split into column-wise (candidate-wise) chunks
+    that each stay within the budget.  A running argmin tracks the best
+    candidate across chunks, producing results identical to the unchunked
+    path.
+
+    Parameters:
+        C_block:         (R, w) int32 challenge submatrix for selected positions
+        ip_base:         (R,) int32 inner products with current values zeroed
+        candidates_i32T: (w, K) int32 candidate tuples, transposed
+        lb, ub:          (R,) float64 constraint bounds (linear mode)
+        z_tilde_int:     (R,) int64 relation values (modular mode), or None
+        beta_eff:        int64 scalar, effective error bound (modular), or None
+        modulus:         int64 scalar, 2^{ell+1} for modular checking, or None
+        offset:          int, index offset added to the returned best index
+                         (used by the parallel path to map back to global indices)
+
+    Returns:
+        (best_global_idx, best_fitness, best_F_count)
+    """
+    R = ip_base.shape[0]
+    num_candidates = candidates_i32T.shape[1]
+
+    # Estimate peak memory per candidate column.  Inside
+    # _compute_fitness_batch (modular path) the dominant intermediates
+    # are the (R, K) arrays that coexist at the peak moment -- when
+    # np.where materialises all three of its arguments plus the output:
+    #   ip_chunk   (int32, 4 B)  -- alive in caller scope
+    #   residual   (int64, 8 B)  -- local variable, alive until return
+    #   bool mask  (bool,  1 B)  -- temporary for np.where condition
+    #   int64 sub  (int64, 8 B)  -- temporary for residual - modulus
+    #   r_centered (int64, 8 B)  -- np.where output
+    # Peak: ~29 B per element; we round up to 32 for safety.
+    _BYTES_PER_ELEMENT = 32
+    chunk_size = max(1,
+                     _CANDIDATE_EVAL_MEMORY_BUDGET // (R * _BYTES_PER_ELEMENT))
+
+    if num_candidates <= chunk_size:
+        # --- Fast path: full matrix fits within memory budget ---
+        ip_new = ip_base[:, np.newaxis] + C_block @ candidates_i32T
+        fitness_vals, F_counts = _compute_fitness_batch(
+            ip_new, lb, ub, z_tilde_int=z_tilde_int,
+            beta_eff=beta_eff, modulus=modulus)
+        best_local = int(np.argmin(fitness_vals))
+        return (offset + best_local,
+                float(fitness_vals[best_local]),
+                int(F_counts[best_local]))
+
+    # --- Chunked path: iterate over candidate slices ---
+    best_idx = 0
+    best_fitness = np.inf
+    best_F = 0
+    for c_start in range(0, num_candidates, chunk_size):
+        c_end = min(c_start + chunk_size, num_candidates)
+        ip_chunk = (ip_base[:, np.newaxis]
+                    + C_block @ candidates_i32T[:, c_start:c_end])
+        fit_chunk, F_chunk = _compute_fitness_batch(
+            ip_chunk, lb, ub, z_tilde_int=z_tilde_int,
+            beta_eff=beta_eff, modulus=modulus)
+        local_best = int(np.argmin(fit_chunk))
+        if fit_chunk[local_best] < best_fitness:
+            best_idx = c_start + local_best
+            best_fitness = float(fit_chunk[local_best])
+            best_F = int(F_chunk[local_best])
+
+    return (offset + best_idx, best_fitness, best_F)
+
+
 def _evaluate_candidate_chunk(C_block, ip_base, lb, ub, candidate_chunk,
                               chunk_offset, z_tilde_int=None, beta_eff=None,
                               modulus=None):
-    """Evaluate fitness for a chunk of candidate assignments (thread worker)."""
-    new_contrib = C_block @ candidate_chunk.astype(np.int32).T
-    ip_new = ip_base[:, np.newaxis] + new_contrib
-    fitness, F_counts = _compute_fitness_batch(ip_new, lb, ub,
-                                               z_tilde_int=z_tilde_int,
-                                               beta_eff=beta_eff,
-                                               modulus=modulus)
-    best_local = int(np.argmin(fitness))
-    return (chunk_offset + best_local,
-            float(fitness[best_local]),
-            int(F_counts[best_local]))
+    """Evaluate fitness for a chunk of candidate assignments (thread worker).
+
+    Thin wrapper around :func:`_find_best_candidate` that accepts int8
+    candidate tuples (as produced by :func:`_precompute_candidates`) and
+    converts them to the transposed int32 layout expected by the evaluator.
+    """
+    return _find_best_candidate(
+        C_block, ip_base, candidate_chunk.astype(np.int32).T, lb, ub,
+        z_tilde_int=z_tilde_int, beta_eff=beta_eff, modulus=modulus,
+        offset=chunk_offset)
 
 
 def _precompute_candidates(values, w):
@@ -622,7 +749,7 @@ def _precompute_candidates(values, w):
 
 
 
-def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
+def _w1_sweep_worker(C, ip_frozen, x_curr, lb, ub, values,
                      position_indices, z_tilde_int=None, beta_eff=None,
                      modulus=None):
     """Evaluate all (2*eta+1) candidates for each position in a batch.
@@ -631,7 +758,7 @@ def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
     vector ip_frozen.  This is the thread worker for the parallel w=1 sweep.
 
     Parameters:
-        C_i32:            (R, n) int32 challenge matrix
+        C:                (R, n) int8 challenge matrix
         ip_frozen:        (R,) inner products at sweep start (frozen)
         x_curr:           (n,) current solution (int8, read-only)
         lb, ub:           (R,) constraint bounds (used when modulus is None)
@@ -647,7 +774,7 @@ def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
     vals_i32 = values.astype(np.int32)
     results = []
     for j in position_indices:
-        c_j = C_i32[:, j]                         # (R,)
+        c_j = C[:, j].astype(np.int32)               # (R,)
         ip_base_j = ip_frozen - c_j * int(x_curr[j])  # (R,)
 
         # ip_base_j[:, None] + c_j[:, None] * vals_i32[None, :]  -> (R, nvals)
@@ -664,7 +791,7 @@ def _w1_sweep_worker(C_i32, ip_frozen, x_curr, lb, ub, values,
     return results
 
 
-def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
+def hillclimb(C, z_tilde, x_init, params, rng, w, patience,
               leakage_index,
               true_key=None, verbose=True, print_keys=False, num_workers=1,
               # Tier 1: Score-guided sampling
@@ -800,7 +927,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
 
     # Current solution state
     x_curr = x_init.copy()
-    ip = C_i32 @ x_curr.astype(np.int32)
+    ip = _matvec_int8(C, x_curr)
     fitness_curr, F_curr = _compute_fitness_scalar(
         ip, lb, ub, z_tilde_int=_z_tilde_int, beta_eff=_beta_eff_scalar,
         modulus=_modulus)
@@ -871,7 +998,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
                     # Apply perturbation
                     x_curr[perturb_pos] = rng.integers(
                         -eta, eta + 1, size=p, dtype=np.int8)
-                    ip = C_i32 @ x_curr.astype(np.int32)
+                    ip = _matvec_int8(C, x_curr)
                     fitness_curr, F_curr = _compute_fitness_scalar(
                         ip, lb, ub, z_tilde_int=_z_tilde_int,
                         beta_eff=_beta_eff_scalar, modulus=_modulus)
@@ -901,7 +1028,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
                 if use_parallel:
                     futures = [
                         executor.submit(
-                            _w1_sweep_worker, C_i32, ip_frozen, x_curr,
+                            _w1_sweep_worker, C, ip_frozen, x_curr,
                             lb, ub, values, chunk,
                             z_tilde_int=_z_tilde_int,
                             beta_eff=_beta_eff_scalar, modulus=_modulus)
@@ -912,7 +1039,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
                         all_results.extend(f.result())
                 else:
                     all_results = _w1_sweep_worker(
-                        C_i32, ip_frozen, x_curr, lb, ub, values,
+                        C, ip_frozen, x_curr, lb, ub, values,
                         all_positions, z_tilde_int=_z_tilde_int,
                         beta_eff=_beta_eff_scalar, modulus=_modulus)
 
@@ -925,7 +1052,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
 
                 # Recompute ip and fitness only if something changed
                 if num_changed > 0:
-                    ip = C_i32 @ x_curr.astype(np.int32)
+                    ip = _matvec_int8(C, x_curr)
                     fitness_new, F_new = _compute_fitness_scalar(
                         ip, lb, ub, z_tilde_int=_z_tilde_int,
                         beta_eff=_beta_eff_scalar, modulus=_modulus)
@@ -993,7 +1120,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
             candidate_tuples, candidates_i32T = get_candidates(actual_w)
             num_candidates = candidate_tuples.shape[0]
 
-            C_block = C_i32[:, positions]
+            C_block = C[:, positions].astype(np.int32)
             x_block_curr = x_curr[positions].astype(np.int32)
             ip_base = ip - C_block @ x_block_curr
 
@@ -1013,13 +1140,10 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
                 best_idx, fitness_best, F_best = min(
                     (f.result() for f in futures), key=lambda r: r[1])
             else:
-                ip_new = ip_base[:, np.newaxis] + C_block @ candidates_i32T
-                fitness_vals, F_counts = _compute_fitness_batch(
-                    ip_new, lb, ub, z_tilde_int=_z_tilde_int,
+                best_idx, fitness_best, F_best = _find_best_candidate(
+                    C_block, ip_base, candidates_i32T, lb, ub,
+                    z_tilde_int=_z_tilde_int,
                     beta_eff=_beta_eff_scalar, modulus=_modulus)
-                best_idx = int(np.argmin(fitness_vals))
-                fitness_best = float(fitness_vals[best_idx])
-                F_best = int(F_counts[best_idx])
 
             # ===== Acceptance logic =====
             strict_improvement = fitness_best < fitness_curr
@@ -1120,7 +1244,7 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, patience,
 # ===================================================================
 # MOSEK ILP fallback: exact key recovery via integer feasibility
 # ===================================================================
-def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
+def mosek_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
                        mosek_timeout=300.0, verbose=True):
     """
     Attempt exact key recovery by solving an Integer Linear Program (ILP)
@@ -1141,7 +1265,7 @@ def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
                    x_j in {-eta, ..., eta}               for all j
 
     Parameters:
-        C_i32:          (R, n) int32 challenge matrix
+        C:              (R, n) int8 challenge matrix
         z_tilde:        (R,) transformed relation values
         x_warm:         (n,) best key estimate from hill climbing (int8)
         params:         ML-DSA parameter dict
@@ -1166,7 +1290,7 @@ def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
     n = params["n"]
     eta = params["eta"]
     beta_eff = compute_beta_eff(params, leakage_index)
-    R = C_i32.shape[0]
+    R = C.shape[0]
 
     lb = z_tilde - beta_eff
     ub = z_tilde + beta_eff
@@ -1200,7 +1324,7 @@ def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
                           Domain.greaterThan(x_warm_f.tolist()))
 
             # Verification relation constraints: lb <= C @ x <= ub
-            C_mosek = Matrix.dense(C_i32.astype(np.float64))
+            C_mosek = Matrix.dense(C.astype(np.float64))
             M.constraint("verify", Expr.mul(C_mosek, x),
                           Domain.inRange(lb.tolist(), ub.tolist()))
 
@@ -1236,7 +1360,7 @@ def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
             x_sol = np.clip(x_sol, -eta, eta)
 
             # Post-solve verification
-            ip_check = C_i32 @ x_sol.astype(np.int32)
+            ip_check = _matvec_int8(C, x_sol)
             violated = int(np.sum((ip_check < lb) | (ip_check > ub)))
 
             if verbose:
@@ -1261,7 +1385,7 @@ def mosek_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
 # ===================================================================
 # Gurobi ILP fallback: exact key recovery via integer feasibility
 # ===================================================================
-def gurobi_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
+def gurobi_ilp_recovery(C, z_tilde, x_warm, params, leakage_index,
                         gurobi_timeout=300.0, norel_time=0.0,
                         solution_limit=1, verbose=True):
     """
@@ -1272,7 +1396,7 @@ def gurobi_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
     corrupted relations impose contradictory constraints.
 
     Parameters:
-        C_i32:          (R, n) int32 challenge matrix
+        C:              (R, n) int8 challenge matrix
         z_tilde:        (R,) transformed relation values
         x_warm:         (n,) best key estimate from hill climbing (int8)
         params:         ML-DSA parameter dict
@@ -1299,7 +1423,7 @@ def gurobi_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
     n = params["n"]
     eta = params["eta"]
     beta_eff = compute_beta_eff(params, leakage_index)
-    R = C_i32.shape[0]
+    R = C.shape[0]
 
     lb = z_tilde - beta_eff
     ub = z_tilde + beta_eff
@@ -1329,7 +1453,7 @@ def gurobi_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
                               lb=float(-eta), ub=float(eta), name="x")
 
                 # Verification relation constraints: lb <= C @ x <= ub
-                C_f64 = C_i32.astype(np.float64)
+                C_f64 = C.astype(np.float64)
                 M.addMConstr(C_f64, x, GRB.GREATER_EQUAL, lb,
                              name="verify_lb")
                 M.addMConstr(C_f64, x, GRB.LESS_EQUAL, ub,
@@ -1392,7 +1516,7 @@ def gurobi_ilp_recovery(C_i32, z_tilde, x_warm, params, leakage_index,
                     x_sol = np.clip(x_sol, -eta, eta)
 
                     # Post-solve constraint verification
-                    ip_check = C_i32 @ x_sol.astype(np.int32)
+                    ip_check = _matvec_int8(C, x_sol)
                     violated = int(np.sum(
                         (ip_check < lb) | (ip_check > ub)))
 
@@ -1585,7 +1709,7 @@ def _print_experiment_banner(args, params, beta_eff, opt_flags, verbose):
 # Per-key result evaluation and solver fallbacks
 # ===================================================================
 def _evaluate_key_result(x_final, F_final, iters_used, num_perturbs,
-                         x_true, C_i32, z_tilde, beta_eff, params, args,
+                         x_true, C, z_tilde, beta_eff, params, args,
                          t_hillclimb, t_datagen, t_regression,
                          key_idx, R, total_sigs,
                          init_correct, init_accuracy, D_init,
@@ -1625,7 +1749,7 @@ def _evaluate_key_result(x_final, F_final, iters_used, num_perturbs,
             print(f"  Attempting MOSEK ILP recovery from "
                   f"hill-climbing warm start (D={D_final})...")
             x_mosek, t_mosek = mosek_ilp_recovery(
-                C_i32, z_tilde, x_final, params, args.leakage,
+                C, z_tilde, x_final, params, args.leakage,
                 mosek_timeout=args.mosek_timeout, verbose=verbose)
 
             if x_mosek is not None:
@@ -1662,7 +1786,7 @@ def _evaluate_key_result(x_final, F_final, iters_used, num_perturbs,
                   f"hill-climbing warm start "
                   f"(D={D_final}{sol_str})...")
             grb_solutions, t_gurobi = gurobi_ilp_recovery(
-                C_i32, z_tilde, x_final, params, args.leakage,
+                C, z_tilde, x_final, params, args.leakage,
                 gurobi_timeout=args.gurobi_timeout,
                 norel_time=args.gurobi_norel_time,
                 solution_limit=args.gurobi_solution_limit,
@@ -1805,7 +1929,6 @@ def run_experiment(args):
                 args.noise_level, num_workers=args.workers)
             t_datagen = perf_counter() - t0
             R = len(z_tilde)
-            C_i32 = C.astype(np.int32)         # single cast for all consumers
             print(f"  Phase 1: {R} inf. rels from {total_sigs} signatures "
                   f"({t_datagen:.1f}s)")
 
@@ -1850,7 +1973,7 @@ def run_experiment(args):
             # --- Phase 2: Hill-climbing ---
             t0 = perf_counter()
             x_final, F_final, iters_used, history, num_perturbs = hillclimb(
-                C_i32, z_tilde, x_init, params, rng,
+                C, z_tilde, x_init, params, rng,
                 w=args.block_size, patience=args.patience,
                 leakage_index=args.leakage,
                 true_key=x_true, verbose=verbose, print_keys=print_keys,
@@ -1874,7 +1997,7 @@ def run_experiment(args):
             # --- Result evaluation, solver fallbacks, result collection ---
             result = _evaluate_key_result(
                 x_final, F_final, iters_used, num_perturbs,
-                x_true, C_i32, z_tilde, beta_eff, params, args,
+                x_true, C, z_tilde, beta_eff, params, args,
                 t_hillclimb, t_datagen, t_regression,
                 key_idx, R, total_sigs,
                 init_correct, init_accuracy, D_init,

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-OUTPUT_FILE="hillclimb_sweep_results_noisy_44_87.txt"
+OUTPUT_FILE="hillclimb_sweep_results_noisy_65.txt"
 
 run_sweep() {
     local params=$1
@@ -15,7 +15,7 @@ run_sweep() {
         echo "${output}" >> "$OUTPUT_FILE"
         echo "" >> "$OUTPUT_FILE"
 
-        if echo "${output}" | grep -q "Summary: 5/5 keys recovered"; then
+            if echo "${output}" | grep -qE "Summary: [45]/5 keys recovered"; then
             ir=$((ir - 500000))
         else
             break
@@ -24,19 +24,19 @@ run_sweep() {
 }
 
 # ML-DSA-44
-run_sweep 44 6 2500000
-run_sweep 44 7 4500000
-run_sweep 44 8 5000000
-#run_sweep 44 9 5000000
-
-# ML-DSA-87
-run_sweep 87 6 2500000
-run_sweep 87 7 4500000
-run_sweep 87 8 6500000
+#run_sweep 44 6 2500000
+#run_sweep 44 7 4500000
+#run_sweep 44 8 5000000
+##run_sweep 44 9 5000000
+#
+## ML-DSA-87
+#run_sweep 87 6 2500000
+#run_sweep 87 7 4500000
+#run_sweep 87 8 6500000
 #run_sweep 87 9 5000000
 #
 ## ML-DSA-65
 #run_sweep 65 6 3000000
 #run_sweep 65 7 5000000
-#run_sweep 65 8 11000000
-#run_sweep 65 9 13000000
+run_sweep 65 8 10000000
+run_sweep 65 9 13000000
