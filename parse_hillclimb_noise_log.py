@@ -28,7 +28,7 @@ from typing import Optional
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-RE_BLOCK_START   = re.compile(r'^# python3 hillclimb_mldsa(?:_noise)?\.py\b')
+RE_BLOCK_START   = re.compile(r'^# python3 (?:\S+/)?hillclimb_mldsa(?:_noise)?\.py\b')
 RE_PARAMS        = re.compile(r'--params\s+(\d+)')
 RE_LEAKAGE       = re.compile(r'--leakage\s+(\d+)')
 RE_INF_RELS_CMD  = re.compile(r'--inf-rels\s+(\d+)')
@@ -48,6 +48,8 @@ RE_SUCCESS       = re.compile(
     r'SUCCESS: key recovered, F=\d+, (\d+) iterations, (\d+) perturbation\(s\) \(([0-9.]+)s\)'
 )
 RE_FAILED        = re.compile(r'FAILED:')
+
+RE_PHASE1_SIGS   = re.compile(r'Phase 1:\s+\d+\s+inf\. rels from\s+(\d+)\s+signatures')
 
 RE_SUMMARY_START = re.compile(r'^=== Summary:')
 RE_SUMMARY_RATE  = re.compile(r'=== Summary:\s+(\d+)/(\d+) keys recovered')
@@ -69,6 +71,7 @@ class KeyResult:
     perturbations: Optional[int] = None
     time_s: Optional[float] = None
     success: bool = False
+    signatures: Optional[int] = None         # signatures consumed in Phase 1
 
 
 @dataclass
@@ -159,6 +162,12 @@ def parse_key_section(key_lines: list[str]) -> KeyResult:
     first_d0_found = False
 
     for line in key_lines:
+        # Phase 1 signatures
+        if kr.signatures is None:
+            m = RE_PHASE1_SIGS.search(line)
+            if m:
+                kr.signatures = int(m.group(1))
+
         # Regression line
         if kr.regression_acc is None:
             m = RE_REGRESSION.search(line)
@@ -261,6 +270,7 @@ HEADER = (
     "j\t"
     "beta_eff\t"
     "Inf_rels\t"
+    "Avg_signatures\t"
     "Success\t"
     "Avg_acc_%\t"
     "Avg_D0\t"
@@ -284,6 +294,8 @@ def experiment_to_row(exp: ExperimentBlock, tier: str) -> str:
     successful_keys = [k for k in exp.keys if k.success]
     n_recovered = len(successful_keys)
     n_total = len(exp.keys) if exp.keys else exp.summary_total
+
+    avg_signatures = safe_avg([k.signatures for k in exp.keys])
 
     avg_acc   = safe_avg([k.regression_acc for k in exp.keys])
     avg_D0    = safe_avg([k.D0 for k in exp.keys])
@@ -311,6 +323,7 @@ def experiment_to_row(exp: ExperimentBlock, tier: str) -> str:
         fmt(exp.leakage_j, 0),
         fmt(exp.beta_eff, 0),
         fmt(exp.inf_rels, 0),
+        fmt(avg_signatures, 1),
         success_str,
         fmt(avg_acc, 1),
         fmt(avg_D0, 1),
