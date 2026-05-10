@@ -913,6 +913,11 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                 # --- Batch parallel w=1 sweep (one iteration = all n positions) ---
                 all_positions = np.arange(n, dtype=int)
                 ip_frozen = ip.copy()
+                
+                # Save pre-sweep state for sanity check
+                x_curr_pre_sweep = x_curr.copy()
+                ip_pre_sweep = ip.copy()
+                fitness_pre_sweep = fitness_curr
 
                 # Split positions into chunks and evaluate in parallel
                 n_chunks = max(1, int(np.ceil(n / w1_batch_size)))
@@ -952,7 +957,22 @@ def hillclimb(C_i32, z_tilde, x_init, params, rng, w, T,
                     fitness_new, F_new = _compute_fitness_scalar(
                         ip, lb, ub, fitness_mode, fitness_lambda,
                         modulus=modulus)
-                    sweep_improved = fitness_new < fitness_curr
+                    
+                    # Sanity check: if fitness got worse, restore pre-sweep state
+                    if fitness_new > fitness_pre_sweep:
+                        if verbose:
+                            print(f"    [SANITY CHECK] w1-sweep fitness degraded "
+                                  f"({fitness_new:.1f} > {fitness_pre_sweep:.1f}), "
+                                  f"restoring pre-sweep state")
+                        x_curr = x_curr_pre_sweep
+                        ip = ip_pre_sweep
+                        fitness_new = fitness_pre_sweep
+                        F_new = int(np.count_nonzero(
+                            (ip < lb) | (ip > ub)))
+                        sweep_improved = False
+                    else:
+                        sweep_improved = fitness_new < fitness_curr
+                    
                     fitness_curr = fitness_new
                     F_curr = F_new
                 else:

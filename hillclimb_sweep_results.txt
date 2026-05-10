@@ -2409,3 +2409,519 @@
   Avg hill-climb time: 64.18s
   Failed keys (iteration limit): 1, avg D_final=20.0, avg F_final=46.0, avg perturbations=0.0
 
+#python3 hillclimb_mldsa.py --params 44 --leakage 5 --num-keys 10 --max-iter 100000 --inf-rels 3000 --seed 42 --default-optimizations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-44 ===
+  Leakage index: 5
+  Effective error bound: beta_eff=16 (< beta=78, j-independence transform skipped)
+  Modular constraints: enabled (mod 64)
+  Informative relations: 3000
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.1s)
+  Regression: 177/256 correct (69.1%), D_0=79 (0.01s)
+  SUCCESS (unique): key recovered in 50 iterations (1.50s)
+
+--- Key 2/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.1s)
+  Regression: 161/256 correct (62.9%), D_0=95 (0.01s)
+  SUCCESS (unique): key recovered in 48 iterations (1.17s)
+
+--- Key 3/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 187/256 correct (73.0%), D_0=69 (0.01s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (1.23s)
+
+--- Key 4/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 171/256 correct (66.8%), D_0=85 (0.01s)
+  SUCCESS (unique): key recovered in 351 iterations, 1 perturbation(s) (4.73s)
+
+--- Key 5/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 186/256 correct (72.7%), D_0=70 (0.01s)
+  SUCCESS (unique): key recovered in 998 iterations, 3 perturbation(s) (12.26s)
+
+--- Key 6/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 178/256 correct (69.5%), D_0=78 (0.01s)
+  SUCCESS (unique): key recovered in 81 iterations (1.62s)
+
+--- Key 7/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 175/256 correct (68.4%), D_0=81 (0.01s)
+  SUCCESS (unique): key recovered in 490 iterations, 1 perturbation(s) (4.92s)
+
+--- Key 8/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 171/256 correct (66.8%), D_0=85 (0.01s)
+  SUCCESS (unique): key recovered in 43 iterations (1.23s)
+
+--- Key 9/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 167/256 correct (65.2%), D_0=89 (0.01s)
+  SUCCESS (unique): key recovered in 696 iterations, 2 perturbation(s) (8.76s)
+
+--- Key 10/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 178/256 correct (69.5%), D_0=78 (0.01s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (1.89s)
+
+
+=== Summary: 10/10 keys recovered (of 10 planned) ===
+  Unique recovery: 8
+  Ambiguous recovery: 2 (avg 2.0 feasible keys)
+  Avg initial accuracy: 68.4%
+  Avg iterations to success: 287
+  Avg perturbations to success: 0.7
+  Avg hill-climb time: 3.93s
+
+#python3 hillclimb_mldsa.py --params 44 --leakage 5 --num-keys 10 --max-iter 100000
+ --inf-rels 2500 --seed 42 --default-optimizations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-44 ===
+  Leakage index: 5
+  Effective error bound: beta_eff=16 (< beta=78, j-independence transform skipped)
+  Modular constraints: enabled (mod 64)
+  Informative relations: 2500
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 172/256 correct (67.2%), D_0=84 (0.01s)
+  SUCCESS (unique): key recovered in 10373 iterations, 26 perturbation(s) (138.77s)
+
+--- Key 2/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 175/256 correct (68.4%), D_0=81 (0.01s)
+  FAILURE: T=100000 reached, F=6, D=19, 150 perturbation(s) (1484.64s)
+
+--- Key 3/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 153/256 correct (59.8%), D_0=103 (0.01s)
+  SUCCESS (unique): key recovered in 10458 iterations, 28 perturbation(s) (114.49s)
+
+--- Key 4/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 170/256 correct (66.4%), D_0=86 (0.01s)
+  FAILURE: T=100000 reached, F=4, D=18, 150 perturbation(s) (1591.68s)
+
+--- Key 5/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 167/256 correct (65.2%), D_0=89 (0.01s)
+  SUCCESS (unique): key recovered in 3444 iterations, 9 perturbation(s) (70.72s)
+
+--- Key 6/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 154/256 correct (60.2%), D_0=102 (0.01s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (23.88s, 2 perturbation(s))
+
+--- Key 7/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 176/256 correct (68.8%), D_0=80 (0.01s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (340.46s, 40 perturbation(s))
+
+--- Key 8/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 159/256 correct (62.1%), D_0=97 (0.02s)
+  SUCCESS (ambiguous): true key among 4 feasible keys (107.57s, 19 perturbation(s))
+
+--- Key 9/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 156/256 correct (60.9%), D_0=100 (0.01s)
+  SUCCESS (ambiguous): true key among 4 feasible keys (91.05s, 25 perturbation(s))
+
+--- Key 10/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 158/256 correct (61.7%), D_0=98 (0.01s)
+  SUCCESS (ambiguous): true key among 29 feasible keys (60.27s, 16 perturbation(s))
+
+
+=== Summary: 8/10 keys recovered (of 10 planned) ===
+  Unique recovery: 3
+  Ambiguous recovery: 5 (avg 8.2 feasible keys)
+  Avg initial accuracy: 64.1%
+  Avg iterations to success: 8350
+  Avg perturbations to success: 20.6
+  Avg hill-climb time: 118.40s
+  Failed keys (iteration limit): 2, avg D_final=18.5, avg F_final=5.0, avg perturbations=150.0
+  
+ # python3 hillclimb_mldsa.py --params 44 --leakage 4 --num-keys 10 --max-iter 100000 --inf-rels 1500 --seed 42 --default-optimiz
+ations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-44 ===
+  Leakage index: 4
+  Effective error bound: beta_eff=8 (< beta=78, j-independence transform skipped)
+  Modular constraints: enabled (mod 32)
+  Informative relations: 1500
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 66/256 correct (25.8%), D_0=190 (0.01s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (0.91s)
+
+--- Key 2/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 54/256 correct (21.1%), D_0=202 (0.00s)
+  SUCCESS (unique): key recovered in 85 iterations (1.60s)
+
+--- Key 3/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 78/256 correct (30.5%), D_0=178 (0.00s)
+  SUCCESS (unique): key recovered in 351 iterations, 1 perturbation(s) (3.40s)
+
+--- Key 4/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 68/256 correct (26.6%), D_0=188 (0.00s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (1.52s)
+
+--- Key 5/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 69/256 correct (27.0%), D_0=187 (0.00s)
+  SUCCESS (unique): key recovered in 132 iterations (1.37s)
+
+--- Key 6/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 58/256 correct (22.7%), D_0=198 (0.00s)
+  SUCCESS (ambiguous): true key among 2 feasible keys (3.33s, 1 perturbation(s))
+
+--- Key 7/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 76/256 correct (29.7%), D_0=180 (0.00s)
+  SUCCESS (ambiguous): true key among 6 feasible keys (2.86s, 1 perturbation(s))
+
+--- Key 8/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 79/256 correct (30.9%), D_0=177 (0.00s)
+  SUCCESS (unique): key recovered in 65 iterations (1.18s)
+
+--- Key 9/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 72/256 correct (28.1%), D_0=184 (0.00s)
+  SUCCESS (ambiguous): true key among 3 feasible keys (1.53s)
+
+--- Key 10/10 ---
+  Phase 1: 1500 inf. rels from 1500 signatures (0.0s)
+  Regression: 63/256 correct (24.6%), D_0=193 (0.00s)
+  SUCCESS (unique): key recovered in 123 iterations (1.94s)
+
+
+=== Summary: 10/10 keys recovered (of 10 planned) ===
+  Unique recovery: 5
+  Ambiguous recovery: 5 (avg 3.0 feasible keys)
+  Avg initial accuracy: 26.7%
+  Avg iterations to success: 188
+  Avg perturbations to success: 0.3
+  Avg hill-climb time: 1.96s
+
+  #python3 hillclimb_mldsa.py --params 65 --leakage 5 --num-keys 10 --max-iter 100000 --inf-rels 3000 --seed 42 --default-optimiz
+ations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-65 ===
+  Leakage index: 5
+  Effective error bound: beta_eff=16 (< beta=196, j-independence transform skipped)
+  Modular constraints: enabled (mod 64)
+  Informative relations: 3000
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.1s)
+  Regression: 47/256 correct (18.4%), D_0=209 (0.01s)
+  SUCCESS (unique): key recovered in 459 iterations, 1 perturbation(s) (22.55s)
+
+--- Key 2/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.1s)
+  Regression: 50/256 correct (19.5%), D_0=206 (0.01s)
+  SUCCESS (unique): key recovered in 83 iterations (2.20s)
+
+--- Key 3/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 40/256 correct (15.6%), D_0=216 (0.01s)
+  SUCCESS (unique): key recovered in 43 iterations (1.63s)
+
+--- Key 4/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 40/256 correct (15.6%), D_0=216 (0.01s)
+  SUCCESS (unique): key recovered in 261 iterations (3.11s)
+
+--- Key 5/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 25/256 correct (9.8%), D_0=231 (0.01s)
+  SUCCESS (unique): key recovered in 39 iterations (1.27s)
+
+--- Key 6/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 44/256 correct (17.2%), D_0=212 (0.01s)
+  SUCCESS (unique): key recovered in 167 iterations (4.31s)
+
+--- Key 7/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 30/256 correct (11.7%), D_0=226 (0.01s)
+  SUCCESS (unique): key recovered in 58 iterations (1.60s)
+
+--- Key 8/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 35/256 correct (13.7%), D_0=221 (0.01s)
+  SUCCESS (unique): key recovered in 94 iterations (2.30s)
+
+--- Key 9/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 45/256 correct (17.6%), D_0=211 (0.01s)
+  SUCCESS (unique): key recovered in 711 iterations, 1 perturbation(s) (36.00s)
+
+--- Key 10/10 ---
+  Phase 1: 3000 inf. rels from 3000 signatures (0.0s)
+  Regression: 38/256 correct (14.8%), D_0=218 (0.01s)
+  SUCCESS (unique): key recovered in 81 iterations (2.73s)
+
+
+=== Summary: 10/10 keys recovered (of 10 planned) ===
+  Unique recovery: 10
+  Avg initial accuracy: 15.4%
+  Avg iterations to success: 200
+  Avg perturbations to success: 0.2
+  Avg hill-climb time: 7.77s
+
+#python3 hillclimb_mldsa.py --params 87 --leakage 4 --num-keys 10 --max-iter 100000 --inf-rels 2000 --seed 42 --default-optimiz
+ations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-87 ===
+  Leakage index: 4
+  Effective error bound: beta_eff=8 (< beta=120, j-independence transform skipped)
+  Modular constraints: enabled (mod 32)
+  Informative relations: 2000
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.1s)
+  Regression: 59/256 correct (23.0%), D_0=197 (0.01s)
+  SUCCESS (unique): key recovered in 604 iterations, 1 perturbation(s) (6.96s)
+
+--- Key 2/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 70/256 correct (27.3%), D_0=186 (0.01s)
+  SUCCESS (unique): key recovered in 82 iterations (1.88s)
+
+--- Key 3/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 54/256 correct (21.1%), D_0=202 (0.01s)
+  SUCCESS (unique): key recovered in 909 iterations, 2 perturbation(s) (11.32s)
+
+--- Key 4/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 56/256 correct (21.9%), D_0=200 (0.01s)
+  SUCCESS (unique): key recovered in 641 iterations, 1 perturbation(s) (6.38s)
+
+--- Key 5/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 52/256 correct (20.3%), D_0=204 (0.01s)
+  FAILURE: T=100000 reached, F=467, D=191, 150 perturbation(s) (997.18s)
+
+--- Key 6/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 53/256 correct (20.7%), D_0=203 (0.01s)
+  SUCCESS (unique): key recovered in 733 iterations, 1 perturbation(s) (7.15s)
+
+--- Key 7/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.1s)
+  Regression: 70/256 correct (27.3%), D_0=186 (0.01s)
+  SUCCESS (unique): key recovered in 36 iterations (0.98s)
+
+--- Key 8/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 61/256 correct (23.8%), D_0=195 (0.01s)
+  SUCCESS (unique): key recovered in 347 iterations (5.37s)
+
+--- Key 9/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 72/256 correct (28.1%), D_0=184 (0.01s)
+  SUCCESS (unique): key recovered in 23 iterations (0.71s)
+
+--- Key 10/10 ---
+  Phase 1: 2000 inf. rels from 2000 signatures (0.0s)
+  Regression: 65/256 correct (25.4%), D_0=191 (0.01s)
+  SUCCESS (unique): key recovered in 29 iterations (0.89s)
+
+
+=== Summary: 9/10 keys recovered (of 10 planned) ===
+  Unique recovery: 9
+  Avg initial accuracy: 23.9%
+  Avg iterations to success: 378
+  Avg perturbations to success: 0.6
+  Avg hill-climb time: 4.63s
+  Failed keys (iteration limit): 1, avg D_final=191.0, avg F_final=467.0, avg perturbations=150.0
+
+#python3 hillclimb_mldsa.py --params 87 --leakage 4 --num-keys 10 --max-iter 100000 --inf-rels 2500 --seed 42 --default-optimiz
+ations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-87 ===
+  Leakage index: 4
+  Effective error bound: beta_eff=8 (< beta=120, j-independence transform skipped)
+  Modular constraints: enabled (mod 32)
+  Informative relations: 2500
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 58/256 correct (22.7%), D_0=198 (0.01s)
+  SUCCESS (unique): key recovered in 43 iterations (1.36s)
+
+--- Key 2/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 56/256 correct (21.9%), D_0=200 (0.01s)
+  SUCCESS (unique): key recovered in 606 iterations, 1 perturbation(s) (8.91s)
+
+--- Key 3/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 62/256 correct (24.2%), D_0=194 (0.01s)
+  SUCCESS (unique): key recovered in 50 iterations (1.62s)
+
+--- Key 4/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 51/256 correct (19.9%), D_0=205 (0.01s)
+  SUCCESS (unique): key recovered in 41 iterations (1.30s)
+
+--- Key 5/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 58/256 correct (22.7%), D_0=198 (0.01s)
+  SUCCESS (unique): key recovered in 561 iterations, 1 perturbation(s) (8.33s)
+
+--- Key 6/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 60/256 correct (23.4%), D_0=196 (0.01s)
+  SUCCESS (unique): key recovered in 54 iterations (1.55s)
+
+--- Key 7/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 58/256 correct (22.7%), D_0=198 (0.01s)
+  SUCCESS (unique): key recovered in 46 iterations (1.44s)
+
+--- Key 8/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 63/256 correct (24.6%), D_0=193 (0.01s)
+  SUCCESS (unique): key recovered in 1427 iterations, 2 perturbation(s) (16.66s)
+
+--- Key 9/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 51/256 correct (19.9%), D_0=205 (0.01s)
+  SUCCESS (unique): key recovered in 26 iterations (0.95s)
+
+--- Key 10/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 62/256 correct (24.2%), D_0=194 (0.01s)
+  SUCCESS (unique): key recovered in 78 iterations (2.28s)
+
+
+=== Summary: 10/10 keys recovered (of 10 planned) ===
+  Unique recovery: 10
+  Avg initial accuracy: 22.6%
+  Avg iterations to success: 293
+  Avg perturbations to success: 0.4
+  Avg hill-climb time: 4.44s
+
+
+
+# python3 hillclimb_mldsa.py --params 87 --leakage 5 --num-keys 10 --max-iter 100000 --inf-rels 2500 --seed 42 --default-optimiz
+ations --non-verbose
+=== Hill-Climbing Experiment v8: ML-DSA-87 ===
+  Leakage index: 5
+  Effective error bound: beta_eff=16 (< beta=120, j-independence transform skipped)
+  Modular constraints: enabled (mod 64)
+  Informative relations: 2500
+  Block size w: 2
+  Max iterations T: 100000
+  Number of keys: 10
+  Seed: 42
+  Verbose: False
+  Fitness: excess (sum of constraint excesses, L1)
+  Optimizations: adaptive-w (max=4, patience=50), lateral-moves, diversify (strength=1.0, sweep=0), perturb-restart (p=30, patience=50, max=150, target=uniform), w1-sweep (batch=16, adaptive from w=2)
+
+--- Key 1/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 145/256 correct (56.6%), D_0=111 (0.01s)
+  SUCCESS (unique): key recovered in 403 iterations, 1 perturbation(s) (5.44s)
+
+--- Key 2/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.1s)
+  Regression: 136/256 correct (53.1%), D_0=120 (0.01s)
+  SUCCESS (unique): key recovered in 1573 iterations, 4 perturbation(s) (14.13s)
+
+--- Key 3/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 141/256 correct (55.1%), D_0=115 (0.01s)
+  SUCCESS (unique): key recovered in 143 iterations (2.03s)
+
+--- Key 4/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 145/256 correct (56.6%), D_0=111 (0.01s)
+  SUCCESS (unique): key recovered in 57 iterations (1.55s)
+
+--- Key 5/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 158/256 correct (61.7%), D_0=98 (0.01s)
+  SUCCESS (unique): key recovered in 276 iterations, 1 perturbation(s) (3.74s)
+
+--- Key 6/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 146/256 correct (57.0%), D_0=110 (0.01s)
+  SUCCESS (unique): key recovered in 196 iterations (2.39s)
+
+--- Key 7/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 142/256 correct (55.5%), D_0=114 (0.01s)
+  SUCCESS (unique): key recovered in 25 iterations (0.57s)
+
+--- Key 8/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 137/256 correct (53.5%), D_0=119 (0.01s)
+  SUCCESS (unique): key recovered in 43 iterations (1.17s)
+
+--- Key 9/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 160/256 correct (62.5%), D_0=96 (0.01s)
+  SUCCESS (unique): key recovered in 73 iterations (1.85s)
+
+--- Key 10/10 ---
+  Phase 1: 2500 inf. rels from 2500 signatures (0.0s)
+  Regression: 145/256 correct (56.6%), D_0=111 (0.01s)
+  SUCCESS (unique): key recovered in 41 iterations (1.25s)
+
+
+=== Summary: 10/10 keys recovered (of 10 planned) ===
+  Unique recovery: 10
+  Avg initial accuracy: 56.8%
+  Avg iterations to success: 283
+  Avg perturbations to success: 0.6
+  Avg hill-climb time: 3.41s

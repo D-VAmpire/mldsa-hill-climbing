@@ -92,11 +92,11 @@ Graceful interruption:
   Model.terminate().
 
 Usage:
-  python hillclimb_mldsa_noisy.py --params 44 --noise-level 0.2 \\
+  python hillclimb_mldsa_noise.py --params 44 --noise-level 0.2 \\
       --inf-rels 25000 --block-size 2
-  python hillclimb_mldsa_noisy.py --params 44 --noise-level 0.2 \\
+  python hillclimb_mldsa_noise.py --params 44 --noise-level 0.2 \\
       --inf-rels 25000 --block-size 2 --all-optimizations
-  python hillclimb_mldsa_noisy.py --params 44 --noise-level 0.3 \\
+  python hillclimb_mldsa_noise.py --params 44 --noise-level 0.3 \\
       --inf-rels 50000 --block-size 2 --default-optimizations \\
       --gurobi --gurobi-timeout 120
 """
@@ -797,7 +797,7 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, patience,
               # Tier 1: Score-guided sampling
               score_weights=None,
               # Tier 2: Adaptive block size / VNS
-              use_adaptive_w=False, adaptive_w_max=4, adaptive_w_patience=100,
+              use_adaptive_w=False, adaptive_w_max=3, adaptive_w_patience=100,
               # Tier 3a: Lateral moves
               use_lateral_moves=False,
               # Tier 3b: Frequency diversification
@@ -1043,6 +1043,12 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, patience,
                         all_positions, z_tilde_int=_z_tilde_int,
                         beta_eff=_beta_eff_scalar, modulus=_modulus)
 
+                # Save state before applying changes, in case they don't improve overall
+                x_curr_old = x_curr.copy()
+                ip_old = ip.copy()
+                fitness_curr_old = fitness_curr
+                F_curr_old = F_curr
+
                 # Apply only strictly improving changes
                 num_changed = 0
                 for j, best_val, best_fit in all_results:
@@ -1056,9 +1062,16 @@ def hillclimb(C, z_tilde, x_init, params, rng, w, patience,
                     fitness_new, F_new = _compute_fitness_scalar(
                         ip, lb, ub, z_tilde_int=_z_tilde_int,
                         beta_eff=_beta_eff_scalar, modulus=_modulus)
-                    sweep_improved = fitness_new < fitness_curr
-                    fitness_curr = fitness_new
-                    F_curr = F_new
+                    sweep_improved = fitness_new < fitness_curr_old
+                    if sweep_improved:
+                        fitness_curr = fitness_new
+                        F_curr = F_new
+                    else:
+                        # Revert to previous solution: interactions made it worse
+                        x_curr = x_curr_old
+                        ip = ip_old
+                        fitness_curr = fitness_curr_old
+                        F_curr = F_curr_old
                 else:
                     sweep_improved = False
 
@@ -2117,8 +2130,8 @@ Examples:
                      help="Temperature for score-guided softmax (default: 2.0)")
     opt.add_argument("--adaptive-w", action="store_true",
                      help="Tier 2: VNS-style adaptive block size")
-    opt.add_argument("--adaptive-w-max", type=int, default=4,
-                     help="Maximum block size during expansion (default: 4)")
+    opt.add_argument("--adaptive-w-max", type=int, default=3,
+                     help="Maximum block size during expansion (default: 3)")
     opt.add_argument("--adaptive-w-patience", type=int, default=100,
                      help="Iters without improvement before expanding w "
                           "(default: 100)")
